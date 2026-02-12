@@ -29,6 +29,8 @@ error ZeroAmount();
 error ZeroAddress();
 /// @dev ERC20 transfer or ETH send failed
 error TransferFailed();
+/// @dev Slippage protection is enforced but min amounts are zero
+error SlippageNotSet();
 
 // ══════════════════════════════════════════════════════════════
 //                   UNISWAP V3 INTERFACE
@@ -92,6 +94,11 @@ contract ArbitrajBotu is FlashLoanSimpleReceiverBase {
     ///         Set to 0 only in test environments.
     uint256 public minProfitBps;
 
+    /// @notice When true, minAmountIntermediate and minAmountFinal
+    ///         must be > 0 to prevent sandwich attacks.
+    ///         Disable only in test/simulation environments.
+    bool public enforceSlippage;
+
     /// @notice Emergency pause flag
     bool public paused;
 
@@ -115,6 +122,7 @@ contract ArbitrajBotu is FlashLoanSimpleReceiverBase {
     event OwnershipTransferred(address indexed from, address indexed to);
     event PauseToggled(bool isPaused, address indexed by);
     event MinProfitBpsUpdated(uint256 oldBps, uint256 newBps);
+    event EnforceSlippageToggled(bool enforced, address indexed by);
     event EmergencyTokenWithdraw(address indexed token, uint256 amount, address indexed to);
     event EmergencyETHWithdraw(uint256 amount, address indexed to);
 
@@ -203,7 +211,8 @@ contract ArbitrajBotu is FlashLoanSimpleReceiverBase {
     ) external onlyOwner whenNotPaused nonReentrant {
         if (amount == 0) revert ZeroAmount();
         if (asset == address(0) || targetToken == address(0)) revert ZeroAddress();
-        if (fee1 == 0 || fee2 == 0) revert InvalidFeeTier();
+        if (!_isValidFeeTier(fee1) || !_isValidFeeTier(fee2)) revert InvalidFeeTier();
+        if (enforceSlippage && (minAmountIntermediate == 0 || minAmountFinal == 0)) revert SlippageNotSet();
 
         bytes memory params = abi.encode(
             targetToken,
@@ -317,6 +326,14 @@ contract ArbitrajBotu is FlashLoanSimpleReceiverBase {
         emit MinProfitBpsUpdated(old, _minProfitBps);
     }
 
+    /// @notice Toggle slippage enforcement.
+    ///         When enabled, executeArbitrage reverts if
+    ///         minAmountIntermediate or minAmountFinal is 0.
+    function setEnforceSlippage(bool _enforce) external onlyOwner {
+        enforceSlippage = _enforce;
+        emit EnforceSlippageToggled(_enforce, msg.sender);
+    }
+
     /// @notice Toggle emergency pause
     function togglePause() external onlyOwner {
         paused = !paused;
@@ -372,6 +389,15 @@ contract ArbitrajBotu is FlashLoanSimpleReceiverBase {
     // ══════════════════════════════════════════════
     //              INTERNAL HELPERS
     // ══════════════════════════════════════════════
+
+    /// @dev Validates that a fee tier is one of Uniswap V3's supported values.
+    ///      100  = 0.01 %  (stablecoin pairs)
+    ///      500  = 0.05 %  (stable / blue-chip)
+    ///      3000 = 0.30 %  (most pairs)
+    ///      10000 = 1.00 % (exotic / low-liquidity)
+    function _isValidFeeTier(uint24 fee) internal pure returns (bool) {
+        return fee == 100 || fee == 500 || fee == 3000 || fee == 10000;
+    }
 
     /// @dev Reset approval to 0 then set — safe for tokens like USDT
     function _safeApprove(address token, address spender, uint256 amt) internal {

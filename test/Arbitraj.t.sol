@@ -10,7 +10,8 @@ import {
     ContractPaused,
     InvalidFeeTier,
     ZeroAmount,
-    ZeroAddress
+    ZeroAddress,
+    SlippageNotSet
 } from "../src/Arbitraj.sol";
 import {IERC20} from "aave-v3-core/contracts/dependencies/openzeppelin/contracts/IERC20.sol";
 
@@ -44,6 +45,7 @@ contract ArbitrajBotuTest is Test {
     event OwnershipTransferred(address indexed from, address indexed to);
     event PauseToggled(bool isPaused, address indexed by);
     event MinProfitBpsUpdated(uint256 oldBps, uint256 newBps);
+    event EnforceSlippageToggled(bool enforced, address indexed by);
     event EmergencyTokenWithdraw(address indexed token, uint256 amount, address indexed to);
     event EmergencyETHWithdraw(uint256 amount, address indexed to);
 
@@ -147,6 +149,81 @@ contract ArbitrajBotuTest is Test {
     function test_executeArbitrage_RevertsIf_InvalidFee() public {
         vm.expectRevert(InvalidFeeTier.selector);
         bot.executeArbitrage(USDC, 1e6, WETH, 0, 3000, 0, 0);
+    }
+
+    function test_executeArbitrage_RevertsIf_NonStandardFee() public {
+        // Fee tier 200 Uniswap V3'te geçerli değil
+        vm.expectRevert(InvalidFeeTier.selector);
+        bot.executeArbitrage(USDC, 1e6, WETH, 200, 3000, 0, 0);
+    }
+
+    function test_executeArbitrage_AcceptsAllValidFeeTiers() public {
+        // fee1=100 (0.01%), fee2=10000 (1.00%) gibi uç değerler kabul edilmeli
+        // Aave flash loan olmadığı için revert eder ama InvalidFeeTier ile değil
+        // Bu test sadece fee tier doğrulamasının geçtiğini kontrol eder
+        try bot.executeArbitrage(USDC, 1e6, WETH, 100, 10000, 0, 0) {
+            // Eğer flash loan başarılı olursa sorun yok
+        } catch (bytes memory reason) {
+            // InvalidFeeTier hatası OLMAMALI
+            assertTrue(
+                keccak256(reason) != keccak256(abi.encodeWithSelector(InvalidFeeTier.selector)),
+                "Fee tier 100/10000 gecerli olmali"
+            );
+        }
+    }
+
+    // ══════════════════════════════════════════════
+    //        SLIPPAGE ENFORCEMENT TESTS
+    // ══════════════════════════════════════════════
+
+    function test_setEnforceSlippage() public {
+        assertFalse(bot.enforceSlippage());
+
+        vm.expectEmit(true, true, true, true);
+        emit EnforceSlippageToggled(true, deployer);
+        bot.setEnforceSlippage(true);
+        assertTrue(bot.enforceSlippage());
+
+        vm.expectEmit(true, true, true, true);
+        emit EnforceSlippageToggled(false, deployer);
+        bot.setEnforceSlippage(false);
+        assertFalse(bot.enforceSlippage());
+    }
+
+    function test_setEnforceSlippage_RevertsIf_NotOwner() public {
+        vm.prank(attacker);
+        vm.expectRevert(Unauthorized.selector);
+        bot.setEnforceSlippage(true);
+    }
+
+    function test_executeArbitrage_RevertsIf_SlippageEnforcedAndZero() public {
+        bot.setEnforceSlippage(true);
+
+        // minAmountIntermediate ve minAmountFinal 0 iken revert etmeli
+        vm.expectRevert(SlippageNotSet.selector);
+        bot.executeArbitrage(USDC, 1e6, WETH, 500, 3000, 0, 0);
+    }
+
+    function test_executeArbitrage_RevertsIf_SlippageEnforcedAndPartialZero() public {
+        bot.setEnforceSlippage(true);
+
+        // Sadece minAmountFinal 0 iken de revert etmeli
+        vm.expectRevert(SlippageNotSet.selector);
+        bot.executeArbitrage(USDC, 1e6, WETH, 500, 3000, 1000, 0);
+    }
+
+    function test_executeArbitrage_PassesIf_SlippageEnforcedAndSet() public {
+        bot.setEnforceSlippage(true);
+
+        // Slippage değerleri set edildiğinde SlippageNotSet hatası OLMAMALI
+        try bot.executeArbitrage(USDC, 1e6, WETH, 500, 3000, 1, 1) {
+            // Flash loan başarılıysa sorun yok
+        } catch (bytes memory reason) {
+            assertTrue(
+                keccak256(reason) != keccak256(abi.encodeWithSelector(SlippageNotSet.selector)),
+                "Slippage set edilmis, SlippageNotSet hatasi olmamali"
+            );
+        }
     }
 
     // ══════════════════════════════════════════════
