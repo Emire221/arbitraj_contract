@@ -4,41 +4,157 @@ pragma solidity ^0.8.20;
 import {Test, console} from "forge-std/Test.sol";
 import {
     ArbitrajBotu,
+    IERC20,
     Unauthorized,
-    OnlyPool,
-    InvalidInitiator,
+    InvalidCaller,
     ContractPaused,
-    InvalidFeeTier,
+    ReentrancyGuard,
+    InsufficientProfit,
     ZeroAmount,
     ZeroAddress,
+    TransferFailed,
     SlippageNotSet
 } from "../src/Arbitraj.sol";
-import {IERC20} from "aave-v3-core/contracts/dependencies/openzeppelin/contracts/IERC20.sol";
 
-/// @title ArbitrajBotuTest — Comprehensive test suite
-/// @notice Run with: forge test --fork-url <MAINNET_RPC> -vvv
+// ══════════════════════════════════════════════════════════════
+//                       MOCK CONTRACTS
+// ══════════════════════════════════════════════════════════════
+
+/// @dev Minimal ERC20 mock with mint capability
+contract MockERC20 {
+    string public name;
+    uint8 public decimals;
+    mapping(address => uint256) public balanceOf;
+
+    constructor(string memory _name, uint8 _decimals) {
+        name = _name;
+        decimals = _decimals;
+    }
+
+    function transfer(address to, uint256 amount) external returns (bool) {
+        require(balanceOf[msg.sender] >= amount, "MockERC20: insufficient balance");
+        balanceOf[msg.sender] -= amount;
+        balanceOf[to] += amount;
+        return true;
+    }
+
+    function mint(address to, uint256 amount) external {
+        balanceOf[to] += amount;
+    }
+}
+
+/// @dev Simulates Uniswap V3 pool flash swap behavior.
+///      Configurable deltas: positive = owed by caller, negative = sent to caller.
+contract MockUniswapV3Pool {
+    address public token0;
+    address public token1;
+    uint24 public fee;
+
+    int256 public mockAmount0Delta;
+    int256 public mockAmount1Delta;
+
+    constructor(address _t0, address _t1, uint24 _fee) {
+        token0 = _t0;
+        token1 = _t1;
+        fee = _fee;
+    }
+
+    function setMockDeltas(int256 _a0, int256 _a1) external {
+        mockAmount0Delta = _a0;
+        mockAmount1Delta = _a1;
+    }
+
+    function swap(
+        address recipient,
+        bool,
+        int256,
+        uint160,
+        bytes calldata data
+    ) external returns (int256, int256) {
+        // Transfer output tokens first (flash swap behavior)
+        if (mockAmount0Delta < 0) {
+            MockERC20(token0).transfer(recipient, uint256(-mockAmount0Delta));
+        }
+        if (mockAmount1Delta < 0) {
+            MockERC20(token1).transfer(recipient, uint256(-mockAmount1Delta));
+        }
+
+        // Call uniswapV3SwapCallback on the recipient
+        (bool ok, bytes memory ret) = recipient.call(
+            abi.encodeWithSignature(
+                "uniswapV3SwapCallback(int256,int256,bytes)",
+                mockAmount0Delta,
+                mockAmount1Delta,
+                data
+            )
+        );
+        if (!ok) {
+            // Bubble up revert reason
+            assembly {
+                revert(add(ret, 32), mload(ret))
+            }
+        }
+
+        return (mockAmount0Delta, mockAmount1Delta);
+    }
+}
+
+/// @dev Simulates Aerodrome V2-style AMM pool.
+///      Configurable amountOut via setMockAmountOut.
+contract MockAerodromePool {
+    address public token0;
+    address public token1;
+    uint256 public mockAmountOut;
+
+    constructor(address _t0, address _t1) {
+        token0 = _t0;
+        token1 = _t1;
+    }
+
+    function setMockAmountOut(uint256 _out) external {
+        mockAmountOut = _out;
+    }
+
+    function getAmountOut(uint256, address) external view returns (uint256) {
+        return mockAmountOut;
+    }
+
+    function swap(
+        uint256 amount0Out,
+        uint256 amount1Out,
+        address to,
+        bytes calldata
+    ) external {
+        if (amount0Out > 0) MockERC20(token0).transfer(to, amount0Out);
+        if (amount1Out > 0) MockERC20(token1).transfer(to, amount1Out);
+    }
+}
+
+// ══════════════════════════════════════════════════════════════
+//                       TEST CONTRACT
+// ══════════════════════════════════════════════════════════════
+
+/// @title ArbitrajBotuTest — Comprehensive unit test suite
+/// @notice Run with: forge test -vvv
 contract ArbitrajBotuTest is Test {
 
-    // ── Constants (Ethereum Mainnet) ───────────────
-    address constant USDC          = 0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48;
-    address constant WETH          = 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2;
-    address constant DAI           = 0x6B175474E89094C44Da98b954EedeAC495271d0F;
-    address constant AAVE_PROVIDER = 0x2f39d218133AFaB8F2B819B1066c7E434Ad94E9e;
-    address constant SWAP_ROUTER   = 0xE592427A0AEce92De3Edee1F18E0157C05861564;
+    // ── Mock Infrastructure ────────────────────────
+    MockERC20 public tokenA;          // e.g. USDC (token0)
+    MockERC20 public tokenB;          // e.g. WETH (token1)
+    MockUniswapV3Pool public uniPool;
+    MockAerodromePool public aeroPool;
 
-    // ── State ──────────────────────────────────────
+    // ── Contract Under Test ────────────────────────
     ArbitrajBotu public bot;
     address public deployer;
     address public attacker;
 
     // ── Events (mirrored for expectEmit) ───────────
     event ArbitrageExecuted(
-        address indexed asset,
-        uint256 amount,
+        address indexed uniPool,
+        address indexed aeroPool,
+        uint256 amountBorrowed,
         uint256 profit,
-        address indexed targetToken,
-        uint24 fee1,
-        uint24 fee2,
         uint256 timestamp
     );
     event OwnershipTransferStarted(address indexed from, address indexed to);
@@ -57,66 +173,202 @@ contract ArbitrajBotuTest is Test {
         deployer = address(this);
         attacker = makeAddr("attacker");
 
-        // Deploy with minProfitBps = 0 (testnet mode)
-        bot = new ArbitrajBotu(AAVE_PROVIDER, SWAP_ROUTER, 0);
+        // Deploy mock tokens
+        tokenA = new MockERC20("TokenA", 6);   // USDC-like
+        tokenB = new MockERC20("TokenB", 18);  // WETH-like
+
+        // Deploy mock pools
+        uniPool = new MockUniswapV3Pool(address(tokenA), address(tokenB), 3000);
+        aeroPool = new MockAerodromePool(address(tokenA), address(tokenB));
+
+        // Deploy bot with minProfitBps = 0 (test mode)
+        bot = new ArbitrajBotu(0);
     }
 
-    /// @dev Allow this test contract to receive ETH (for emergencyWithdrawEth)
+    /// @dev Allow this test contract to receive ETH
     receive() external payable {}
 
     // ══════════════════════════════════════════════
-    //    CORE FLOW — DIRECT executeOperation TEST
+    //     CORE FLOW — SUCCESSFUL ARBITRAGE
     // ══════════════════════════════════════════════
     //
-    //  We simulate the flash-loan callback directly:
-    //  fund the bot with `amount` of the asset (as Aave would),
-    //  plus extra to cover swap-fee losses, then call
-    //  executeOperation from the POOL address.
-    //  This is fork-agnostic: it tests the dual-swap + profit
-    //  logic regardless of Aave Pool reserve state.
+    //  Scenario: Flash swap on Uni V3, sell on Aerodrome for profit.
+    //
+    //  1. Uni V3: owe 1000 tokenA, receive 1 tokenB
+    //  2. Aerodrome: sell 1 tokenB → get 1050 tokenA
+    //  3. Pay 1000 tokenA to Uni V3
+    //  4. Profit: 50 tokenA → owner
 
-    function test_executeOperation_SwapFlow() public {
-        address pool = address(bot.POOL());
-        uint256 amount  = 1_000 * 1e6;  // 1 000 USDC
-        uint256 premium = amount * 5 / 10_000; // 0.05 % Aave fee
+    function test_executeArbitrage_Success() public {
+        uint256 amountOwed = 1000e6;        // Owe 1000 tokenA to Uni V3
+        uint256 amountReceived = 1e18;      // Receive 1 tokenB from Uni V3
+        uint256 aeroOutput = 1050e6;        // Aerodrome gives 1050 tokenA
 
-        // Fund bot as if Aave transferred flash loan + extra for losses
-        deal(USDC, address(bot), amount + 500 * 1e6);
+        // Configure mocks
+        // amount0Delta > 0 → owe tokenA (token0)
+        // amount1Delta < 0 → receive tokenB (token1)
+        uniPool.setMockDeltas(int256(amountOwed), -int256(amountReceived));
+        tokenB.mint(address(uniPool), amountReceived);   // Fund Uni V3 with output
+        aeroPool.setMockAmountOut(aeroOutput);
+        tokenA.mint(address(aeroPool), aeroOutput);       // Fund Aerodrome with output
 
-        bytes memory params = abi.encode(
-            WETH,             // targetToken
-            uint24(500),      // fee1: 0.05 %
-            uint24(3000),     // fee2: 0.30 %
-            uint256(0),       // minAmountIntermediate
-            uint256(0)        // minAmountFinal
+        uint256 ownerBefore = tokenA.balanceOf(deployer);
+
+        bot.executeArbitrage(
+            address(uniPool),
+            address(aeroPool),
+            true,                   // zeroForOne
+            int256(amountReceived), // amountSpecified (ignored by mock)
+            0,                      // sqrtPriceLimitX96
+            0                       // minProfit
         );
 
-        uint256 ownerBefore = IERC20(USDC).balanceOf(deployer);
+        uint256 profit = tokenA.balanceOf(deployer) - ownerBefore;
+        assertEq(profit, 50e6, "Profit should be 50 tokenA");
+        assertEq(tokenA.balanceOf(address(bot)), 0, "Bot should hold 0 tokenA");
 
-        vm.prank(pool);
-        bool ok = bot.executeOperation(USDC, amount, premium, address(bot), params);
-        assertTrue(ok, "executeOperation must return true");
-
-        uint256 ownerAfter = IERC20(USDC).balanceOf(deployer);
-        console.log("Owner balance change:", ownerAfter - ownerBefore);
-        console.log("Bot residual USDC:  ", IERC20(USDC).balanceOf(address(bot)));
+        console.log("Profit:", profit);
     }
 
-    function test_executeOperation_EmitsArbitrageEvent() public {
-        address pool = address(bot.POOL());
-        uint256 amount  = 500 * 1e6;
-        uint256 premium = amount * 5 / 10_000;
+    function test_executeArbitrage_EmitsEvent() public {
+        uint256 amountOwed = 1000e6;
+        uint256 amountReceived = 1e18;
+        uint256 aeroOutput = 1050e6;
 
-        deal(USDC, address(bot), amount + 500 * 1e6);
+        uniPool.setMockDeltas(int256(amountOwed), -int256(amountReceived));
+        tokenB.mint(address(uniPool), amountReceived);
+        aeroPool.setMockAmountOut(aeroOutput);
+        tokenA.mint(address(aeroPool), aeroOutput);
 
-        bytes memory params = abi.encode(WETH, uint24(500), uint24(3000), uint256(0), uint256(0));
-
-        // Expect the ArbitrageExecuted event (check indexed fields only)
         vm.expectEmit(true, true, false, false);
-        emit ArbitrageExecuted(USDC, amount, 0, WETH, 500, 3000, 0);
+        emit ArbitrageExecuted(address(uniPool), address(aeroPool), 0, 0, 0);
 
-        vm.prank(pool);
-        bot.executeOperation(USDC, amount, premium, address(bot), params);
+        bot.executeArbitrage(
+            address(uniPool), address(aeroPool), true, int256(amountReceived), 0, 0
+        );
+    }
+
+    function test_executeArbitrage_ReverseDirection() public {
+        // zeroForOne = false: owe tokenB (token1), receive tokenA (token0)
+        uint256 amountOwed = 1e18;          // Owe 1 tokenB
+        uint256 amountReceived = 1000e6;    // Receive 1000 tokenA
+
+        // amount0Delta < 0 → receive tokenA, amount1Delta > 0 → owe tokenB
+        uniPool.setMockDeltas(-int256(amountReceived), int256(amountOwed));
+        tokenA.mint(address(uniPool), amountReceived);
+
+        // Aerodrome: sell 1000 tokenA → get 1.05 tokenB
+        uint256 aeroOutput = 1.05e18;
+        aeroPool.setMockAmountOut(aeroOutput);
+        tokenB.mint(address(aeroPool), aeroOutput);
+
+        uint256 ownerBefore = tokenB.balanceOf(deployer);
+
+        bot.executeArbitrage(
+            address(uniPool), address(aeroPool), false, -int256(amountReceived), 0, 0
+        );
+
+        uint256 profit = tokenB.balanceOf(deployer) - ownerBefore;
+        assertEq(profit, 0.05e18, "Profit should be 0.05 tokenB");
+    }
+
+    function test_executeArbitrage_ExactBreakeven() public {
+        // Aerodrome output == amountOwed → profit = 0, should pass with minProfit=0
+        uint256 amountOwed = 1000e6;
+        uint256 amountReceived = 1e18;
+        uint256 aeroOutput = 1000e6;
+
+        uniPool.setMockDeltas(int256(amountOwed), -int256(amountReceived));
+        tokenB.mint(address(uniPool), amountReceived);
+        aeroPool.setMockAmountOut(aeroOutput);
+        tokenA.mint(address(aeroPool), aeroOutput);
+
+        uint256 ownerBefore = tokenA.balanceOf(deployer);
+
+        bot.executeArbitrage(
+            address(uniPool), address(aeroPool), true, int256(amountReceived), 0, 0
+        );
+
+        uint256 profit = tokenA.balanceOf(deployer) - ownerBefore;
+        assertEq(profit, 0, "Breakeven: no profit");
+    }
+
+    // ══════════════════════════════════════════════
+    //         PROFIT VALIDATION TESTS
+    // ══════════════════════════════════════════════
+
+    function test_executeArbitrage_RevertsIf_InsufficientOutput() public {
+        uint256 amountOwed = 1000e6;
+        uint256 amountReceived = 1e18;
+        uint256 aeroOutput = 900e6;         // Less than owed!
+
+        uniPool.setMockDeltas(int256(amountOwed), -int256(amountReceived));
+        tokenB.mint(address(uniPool), amountReceived);
+        aeroPool.setMockAmountOut(aeroOutput);
+        tokenA.mint(address(aeroPool), aeroOutput);
+
+        vm.expectRevert(); // InsufficientProfit
+        bot.executeArbitrage(
+            address(uniPool), address(aeroPool), true, int256(amountReceived), 0, 0
+        );
+    }
+
+    function test_executeArbitrage_RevertsIf_BelowAbsoluteMinProfit() public {
+        uint256 amountOwed = 1000e6;
+        uint256 amountReceived = 1e18;
+        uint256 aeroOutput = 1001e6;        // Only 1 tokenA profit
+
+        uniPool.setMockDeltas(int256(amountOwed), -int256(amountReceived));
+        tokenB.mint(address(uniPool), amountReceived);
+        aeroPool.setMockAmountOut(aeroOutput);
+        tokenA.mint(address(aeroPool), aeroOutput);
+
+        // minProfit = 50e6, actual profit = 1e6 → revert
+        vm.expectRevert();
+        bot.executeArbitrage(
+            address(uniPool), address(aeroPool), true, int256(amountReceived), 0, 50e6
+        );
+    }
+
+    function test_executeArbitrage_RevertsIf_BelowMinProfitBps() public {
+        // Set minProfitBps to 100 (1%)
+        bot.setMinProfitBps(100);
+
+        uint256 amountOwed = 1000e6;
+        uint256 amountReceived = 1e18;
+        uint256 aeroOutput = 1005e6;        // 5 tokenA profit = 0.5% < 1%
+
+        uniPool.setMockDeltas(int256(amountOwed), -int256(amountReceived));
+        tokenB.mint(address(uniPool), amountReceived);
+        aeroPool.setMockAmountOut(aeroOutput);
+        tokenA.mint(address(aeroPool), aeroOutput);
+
+        vm.expectRevert(); // InsufficientProfit
+        bot.executeArbitrage(
+            address(uniPool), address(aeroPool), true, int256(amountReceived), 0, 0
+        );
+    }
+
+    function test_executeArbitrage_PassesIf_AboveMinProfitBps() public {
+        // Set minProfitBps to 100 (1%)
+        bot.setMinProfitBps(100);
+
+        uint256 amountOwed = 1000e6;
+        uint256 amountReceived = 1e18;
+        uint256 aeroOutput = 1020e6;        // 20 tokenA = 2% > 1% ✓
+
+        uniPool.setMockDeltas(int256(amountOwed), -int256(amountReceived));
+        tokenB.mint(address(uniPool), amountReceived);
+        aeroPool.setMockAmountOut(aeroOutput);
+        tokenA.mint(address(aeroPool), aeroOutput);
+
+        uint256 ownerBefore = tokenA.balanceOf(deployer);
+
+        bot.executeArbitrage(
+            address(uniPool), address(aeroPool), true, int256(amountReceived), 0, 0
+        );
+
+        assertEq(tokenA.balanceOf(deployer) - ownerBefore, 20e6);
     }
 
     // ══════════════════════════════════════════════
@@ -126,50 +378,48 @@ contract ArbitrajBotuTest is Test {
     function test_executeArbitrage_RevertsIf_NotOwner() public {
         vm.prank(attacker);
         vm.expectRevert(Unauthorized.selector);
-        bot.executeArbitrage(USDC, 1e6, WETH, 500, 3000, 0, 0);
+        bot.executeArbitrage(address(uniPool), address(aeroPool), true, 1, 0, 0);
     }
 
     function test_executeArbitrage_RevertsIf_Paused() public {
         bot.togglePause();
 
         vm.expectRevert(ContractPaused.selector);
-        bot.executeArbitrage(USDC, 1e6, WETH, 500, 3000, 0, 0);
+        bot.executeArbitrage(address(uniPool), address(aeroPool), true, 1, 0, 0);
     }
 
     function test_executeArbitrage_RevertsIf_ZeroAmount() public {
         vm.expectRevert(ZeroAmount.selector);
-        bot.executeArbitrage(USDC, 0, WETH, 500, 3000, 0, 0);
+        bot.executeArbitrage(address(uniPool), address(aeroPool), true, 0, 0, 0);
     }
 
-    function test_executeArbitrage_RevertsIf_ZeroAddress() public {
+    function test_executeArbitrage_RevertsIf_ZeroUniPool() public {
         vm.expectRevert(ZeroAddress.selector);
-        bot.executeArbitrage(address(0), 1e6, WETH, 500, 3000, 0, 0);
+        bot.executeArbitrage(address(0), address(aeroPool), true, 1, 0, 0);
     }
 
-    function test_executeArbitrage_RevertsIf_InvalidFee() public {
-        vm.expectRevert(InvalidFeeTier.selector);
-        bot.executeArbitrage(USDC, 1e6, WETH, 0, 3000, 0, 0);
+    function test_executeArbitrage_RevertsIf_ZeroAeroPool() public {
+        vm.expectRevert(ZeroAddress.selector);
+        bot.executeArbitrage(address(uniPool), address(0), true, 1, 0, 0);
     }
 
-    function test_executeArbitrage_RevertsIf_NonStandardFee() public {
-        // Fee tier 200 Uniswap V3'te geçerli değil
-        vm.expectRevert(InvalidFeeTier.selector);
-        bot.executeArbitrage(USDC, 1e6, WETH, 200, 3000, 0, 0);
+    // ══════════════════════════════════════════════
+    //        CALLBACK SECURITY TESTS
+    // ══════════════════════════════════════════════
+
+    function test_callback_RevertsIf_CallerNotExpectedPool() public {
+        // Direct call from attacker — _expectedPool is address(0)
+        vm.prank(attacker);
+        vm.expectRevert(InvalidCaller.selector);
+        bot.uniswapV3SwapCallback(0, 0, "");
     }
 
-    function test_executeArbitrage_AcceptsAllValidFeeTiers() public {
-        // fee1=100 (0.01%), fee2=10000 (1.00%) gibi uç değerler kabul edilmeli
-        // Aave flash loan olmadığı için revert eder ama InvalidFeeTier ile değil
-        // Bu test sadece fee tier doğrulamasının geçtiğini kontrol eder
-        try bot.executeArbitrage(USDC, 1e6, WETH, 100, 10000, 0, 0) {
-            // Eğer flash loan başarılı olursa sorun yok
-        } catch (bytes memory reason) {
-            // InvalidFeeTier hatası OLMAMALI
-            assertTrue(
-                keccak256(reason) != keccak256(abi.encodeWithSelector(InvalidFeeTier.selector)),
-                "Fee tier 100/10000 gecerli olmali"
-            );
-        }
+    function test_callback_RevertsIf_RandomContractCalls() public {
+        // Even a contract address can't call if it's not _expectedPool
+        address randomContract = makeAddr("randomContract");
+        vm.prank(randomContract);
+        vm.expectRevert(InvalidCaller.selector);
+        bot.uniswapV3SwapCallback(1e6, -1e18, abi.encode(address(aeroPool), uint256(0)));
     }
 
     // ══════════════════════════════════════════════
@@ -196,53 +446,29 @@ contract ArbitrajBotuTest is Test {
         bot.setEnforceSlippage(true);
     }
 
-    function test_executeArbitrage_RevertsIf_SlippageEnforcedAndZero() public {
+    function test_executeArbitrage_RevertsIf_SlippageEnforcedAndZeroMinProfit() public {
         bot.setEnforceSlippage(true);
 
-        // minAmountIntermediate ve minAmountFinal 0 iken revert etmeli
         vm.expectRevert(SlippageNotSet.selector);
-        bot.executeArbitrage(USDC, 1e6, WETH, 500, 3000, 0, 0);
+        bot.executeArbitrage(address(uniPool), address(aeroPool), true, 1, 0, 0);
     }
 
-    function test_executeArbitrage_RevertsIf_SlippageEnforcedAndPartialZero() public {
+    function test_executeArbitrage_PassesIf_SlippageEnforcedAndMinProfitSet() public {
         bot.setEnforceSlippage(true);
 
-        // Sadece minAmountFinal 0 iken de revert etmeli
-        vm.expectRevert(SlippageNotSet.selector);
-        bot.executeArbitrage(USDC, 1e6, WETH, 500, 3000, 1000, 0);
-    }
+        uint256 amountOwed = 1000e6;
+        uint256 amountReceived = 1e18;
+        uint256 aeroOutput = 1100e6;
 
-    function test_executeArbitrage_PassesIf_SlippageEnforcedAndSet() public {
-        bot.setEnforceSlippage(true);
+        uniPool.setMockDeltas(int256(amountOwed), -int256(amountReceived));
+        tokenB.mint(address(uniPool), amountReceived);
+        aeroPool.setMockAmountOut(aeroOutput);
+        tokenA.mint(address(aeroPool), aeroOutput);
 
-        // Slippage değerleri set edildiğinde SlippageNotSet hatası OLMAMALI
-        try bot.executeArbitrage(USDC, 1e6, WETH, 500, 3000, 1, 1) {
-            // Flash loan başarılıysa sorun yok
-        } catch (bytes memory reason) {
-            assertTrue(
-                keccak256(reason) != keccak256(abi.encodeWithSelector(SlippageNotSet.selector)),
-                "Slippage set edilmis, SlippageNotSet hatasi olmamali"
-            );
-        }
-    }
-
-    // ══════════════════════════════════════════════
-    //       EXECUTE OPERATION — SECURITY
-    // ══════════════════════════════════════════════
-
-    function test_executeOperation_RevertsIf_CallerIsNotPool() public {
-        vm.prank(attacker);
-        vm.expectRevert(OnlyPool.selector);
-        bot.executeOperation(USDC, 1e6, 0, address(bot), "");
-    }
-
-    function test_executeOperation_RevertsIf_WrongInitiator() public {
-        address pool = address(bot.POOL());
-        bytes memory params = abi.encode(WETH, uint24(500), uint24(3000), uint256(0), uint256(0));
-
-        vm.prank(pool);
-        vm.expectRevert(InvalidInitiator.selector);
-        bot.executeOperation(USDC, 1e6, 0, attacker, params);
+        // minProfit = 1 → SlippageNotSet should NOT revert
+        bot.executeArbitrage(
+            address(uniPool), address(aeroPool), true, int256(amountReceived), 0, 1
+        );
     }
 
     // ══════════════════════════════════════════════
@@ -263,22 +489,6 @@ contract ArbitrajBotuTest is Test {
         vm.prank(attacker);
         vm.expectRevert(Unauthorized.selector);
         bot.setMinProfitBps(10);
-    }
-
-    function test_minProfit_RevertsIf_BelowThreshold() public {
-        // Set impossibly high min profit
-        bot.setMinProfitBps(5000); // 50 %
-
-        address pool = address(bot.POOL());
-        uint256 amount  = 1_000 * 1e6;
-        uint256 premium = amount * 5 / 10_000;
-
-        deal(USDC, address(bot), amount + 500 * 1e6);
-        bytes memory params = abi.encode(WETH, uint24(500), uint24(3000), uint256(0), uint256(0));
-
-        vm.prank(pool);
-        vm.expectRevert(); // InsufficientProfit
-        bot.executeOperation(USDC, amount, premium, address(bot), params);
     }
 
     // ══════════════════════════════════════════════
@@ -348,26 +558,26 @@ contract ArbitrajBotuTest is Test {
     // ══════════════════════════════════════════════
 
     function test_emergencyWithdrawToken_FullBalance() public {
-        deal(USDC, address(bot), 500 * 1e6);
+        tokenA.mint(address(bot), 500e6);
 
         vm.expectEmit(true, true, true, true);
-        emit EmergencyTokenWithdraw(USDC, 500 * 1e6, deployer);
-        bot.emergencyWithdrawToken(USDC, 0); // 0 = full balance
+        emit EmergencyTokenWithdraw(address(tokenA), 500e6, deployer);
+        bot.emergencyWithdrawToken(address(tokenA), 0); // 0 = full balance
 
-        assertEq(IERC20(USDC).balanceOf(address(bot)), 0);
+        assertEq(tokenA.balanceOf(address(bot)), 0);
     }
 
     function test_emergencyWithdrawToken_PartialAmount() public {
-        deal(USDC, address(bot), 500 * 1e6);
-        bot.emergencyWithdrawToken(USDC, 200 * 1e6);
+        tokenA.mint(address(bot), 500e6);
+        bot.emergencyWithdrawToken(address(tokenA), 200e6);
 
-        assertEq(IERC20(USDC).balanceOf(address(bot)), 300 * 1e6);
+        assertEq(tokenA.balanceOf(address(bot)), 300e6);
     }
 
     function test_emergencyWithdrawToken_RevertsIf_NotOwner() public {
         vm.prank(attacker);
         vm.expectRevert(Unauthorized.selector);
-        bot.emergencyWithdrawToken(USDC, 0);
+        bot.emergencyWithdrawToken(address(tokenA), 0);
     }
 
     function test_emergencyWithdrawToken_RevertsIf_ZeroAddress() public {
@@ -376,9 +586,7 @@ contract ArbitrajBotuTest is Test {
     }
 
     function test_emergencyWithdrawEth() public {
-        // Reset bot ETH to 0 first (fork may have residual balance)
         vm.deal(address(bot), 0);
-        // Then set exactly 1 ETH
         vm.deal(address(bot), 1 ether);
 
         uint256 ownerBefore = deployer.balance;
@@ -392,7 +600,6 @@ contract ArbitrajBotuTest is Test {
     }
 
     function test_emergencyWithdrawEth_RevertsIf_ZeroBalance() public {
-        // Ensure bot has 0 ETH
         vm.deal(address(bot), 0);
 
         vm.expectRevert(ZeroAmount.selector);
@@ -404,8 +611,8 @@ contract ArbitrajBotuTest is Test {
     // ══════════════════════════════════════════════
 
     function test_getBalance() public {
-        deal(USDC, address(bot), 1234 * 1e6);
-        assertEq(bot.getBalance(USDC), 1234 * 1e6);
+        tokenA.mint(address(bot), 1234e6);
+        assertEq(bot.getBalance(address(tokenA)), 1234e6);
     }
 
     // ══════════════════════════════════════════════
@@ -414,14 +621,14 @@ contract ArbitrajBotuTest is Test {
 
     function test_constructor_SetsState() public view {
         assertEq(bot.owner(), deployer);
-        assertEq(address(bot.SWAP_ROUTER()), SWAP_ROUTER);
         assertEq(bot.minProfitBps(), 0);
         assertFalse(bot.paused());
+        assertFalse(bot.enforceSlippage());
     }
 
-    function test_constructor_RevertsIf_ZeroRouter() public {
-        vm.expectRevert(ZeroAddress.selector);
-        new ArbitrajBotu(AAVE_PROVIDER, address(0), 0);
+    function test_constructor_WithMinProfitBps() public {
+        ArbitrajBotu customBot = new ArbitrajBotu(50);
+        assertEq(customBot.minProfitBps(), 50);
     }
 
     // ══════════════════════════════════════════════
@@ -429,7 +636,6 @@ contract ArbitrajBotuTest is Test {
     // ══════════════════════════════════════════════
 
     function test_receiveETH() public {
-        // Reset and check delta
         vm.deal(address(bot), 0);
         uint256 before = address(bot).balance;
 

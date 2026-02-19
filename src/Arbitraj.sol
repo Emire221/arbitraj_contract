@@ -1,81 +1,107 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
-import {FlashLoanSimpleReceiverBase} from "aave-v3-core/contracts/flashloan/base/FlashLoanSimpleReceiverBase.sol";
-import {IPoolAddressesProvider} from "aave-v3-core/contracts/interfaces/IPoolAddressesProvider.sol";
-import {IERC20} from "aave-v3-core/contracts/dependencies/openzeppelin/contracts/IERC20.sol";
-
 // ══════════════════════════════════════════════════════════════
 //                        CUSTOM ERRORS
 // ══════════════════════════════════════════════════════════════
 
 /// @dev Caller is not authorized
 error Unauthorized();
-/// @dev Only the Aave Pool may call this function
-error OnlyPool();
-/// @dev Flash loan was not initiated by this contract
-error InvalidInitiator();
+/// @dev Callback caller is not the expected Uniswap V3 pool
+error InvalidCaller();
 /// @dev Contract is paused
 error ContractPaused();
 /// @dev Reentrancy detected
 error ReentrancyGuard();
 /// @dev Insufficient profit after arbitrage
 error InsufficientProfit(uint256 required, uint256 actual);
-/// @dev Invalid Uniswap fee tier
-error InvalidFeeTier();
 /// @dev Amount must be > 0
 error ZeroAmount();
 /// @dev Address must not be zero
 error ZeroAddress();
-/// @dev ERC20 transfer or ETH send failed
+/// @dev ERC20 transfer failed
 error TransferFailed();
-/// @dev Slippage protection is enforced but min amounts are zero
+/// @dev Slippage protection: minProfit must be > 0 when enforced
 error SlippageNotSet();
 
 // ══════════════════════════════════════════════════════════════
-//                   UNISWAP V3 INTERFACE
+//                       MINIMAL IERC20
 // ══════════════════════════════════════════════════════════════
 
-/// @title ISwapRouter — Uniswap V3 SwapRouter interface
-interface ISwapRouter {
-    struct ExactInputSingleParams {
-        address tokenIn;
-        address tokenOut;
-        uint24 fee;
-        address recipient;
-        uint256 deadline;
-        uint256 amountIn;
-        uint256 amountOutMinimum;
-        uint160 sqrtPriceLimitX96;
-    }
+interface IERC20 {
+    function balanceOf(address account) external view returns (uint256);
+    function transfer(address to, uint256 amount) external returns (bool);
+}
 
-    function exactInputSingle(
-        ExactInputSingleParams calldata params
-    ) external payable returns (uint256 amountOut);
+// ══════════════════════════════════════════════════════════════
+//                  UNISWAP V3 POOL INTERFACE
+// ══════════════════════════════════════════════════════════════
+
+/// @title IUniswapV3Pool — Direct pool-level interaction (NO router)
+/// @dev   Flash swap kaynağı. swap() çağrıldığında output token'lar
+///        önce gönderilir, ardından uniswapV3SwapCallback çağrılarak
+///        ödeme talep edilir. Bu mekanizma EVM'deki en ucuz borçlanma yöntemidir.
+interface IUniswapV3Pool {
+    function swap(
+        address recipient,
+        bool zeroForOne,
+        int256 amountSpecified,
+        uint160 sqrtPriceLimitX96,
+        bytes calldata data
+    ) external returns (int256 amount0, int256 amount1);
+
+    function token0() external view returns (address);
+    function token1() external view returns (address);
+    function fee() external view returns (uint24);
+}
+
+// ══════════════════════════════════════════════════════════════
+//                  AERODROME POOL INTERFACE
+// ══════════════════════════════════════════════════════════════
+
+/// @title IAerodromePool — Direct pool-level interaction (V2-style AMM)
+/// @dev   Arbitrajın ikinci ayağı. Uniswap'tan alınan token burada
+///        daha pahalıya satılır, elde edilen token ile Uniswap borcu ödenir.
+interface IAerodromePool {
+    function swap(
+        uint256 amount0Out,
+        uint256 amount1Out,
+        address to,
+        bytes calldata data
+    ) external;
+
+    function getAmountOut(
+        uint256 amountIn,
+        address tokenIn
+    ) external view returns (uint256);
+
+    function token0() external view returns (address);
+    function token1() external view returns (address);
 }
 
 // ══════════════════════════════════════════════════════════════
 //                       MAIN CONTRACT
 // ══════════════════════════════════════════════════════════════
 
-/// @title  ArbitrajBotu — Atomic Flash-Loan Arbitrage Engine
-/// @notice Executes risk-free arbitrage between Uniswap V3 fee-tier pools
-///         using Aave V3 flash loans. If any step fails the entire
-///         transaction reverts — you never lose the borrowed capital.
+/// @title  ArbitrajBotu — Gas-Optimized Flash Swap Arbitrage Engine
+/// @notice Executes atomic arbitrage between Uniswap V3 and Aerodrome
+///         using Uniswap V3 flash swaps (zero-capital). No routers,
+///         no Aave — direct pool-to-pool for minimum gas.
 ///
-/// @dev    Security features:
+/// @dev    Architecture:
+///           1. IUniswapV3Pool.swap() → receive tokens (flash swap)
+///           2. uniswapV3SwapCallback() →
+///              a. Sell received tokens on Aerodrome (direct pool call)
+///              b. Pay Uniswap V3 pool debt
+///              c. Transfer profit to owner
+///
+///         Security:
 ///           • Owner-only execution with 2-step ownership transfer
 ///           • Reentrancy guard on every external entry point
-///           • Flash-loan caller (Pool) & initiator validation
-///           • Per-swap slippage protection (amountOutMinimum)
-///           • Configurable minimum-profit threshold (basis points)
+///           • Flash swap callback caller validation (_expectedPool)
+///           • Configurable minimum-profit threshold (bps + absolute)
 ///           • Emergency pause + token / ETH rescue
-///
-///         Flow:
-///           executeArbitrage() → Aave flashLoanSimple()
-///             → executeOperation() → Swap 1 → Swap 2
-///             → Validate profit → Repay Aave → Send profit to owner
-contract ArbitrajBotu is FlashLoanSimpleReceiverBase {
+contract ArbitrajBotu {
 
     // ──────────────────────────────────────────────
     //                STATE VARIABLES
@@ -87,16 +113,12 @@ contract ArbitrajBotu is FlashLoanSimpleReceiverBase {
     /// @notice Pending owner for 2-step transfer
     address public pendingOwner;
 
-    /// @notice Uniswap V3 SwapRouter (immutable = cheaper reads)
-    ISwapRouter public immutable SWAP_ROUTER;
-
     /// @notice Minimum acceptable profit in basis points (1 bp = 0.01 %)
     ///         Set to 0 only in test environments.
     uint256 public minProfitBps;
 
-    /// @notice When true, minAmountIntermediate and minAmountFinal
+    /// @notice When true, minProfit parameter in executeArbitrage
     ///         must be > 0 to prevent sandwich attacks.
-    ///         Disable only in test/simulation environments.
     bool public enforceSlippage;
 
     /// @notice Emergency pause flag
@@ -105,17 +127,19 @@ contract ArbitrajBotu is FlashLoanSimpleReceiverBase {
     /// @dev Reentrancy lock: 1 = unlocked, 2 = locked
     uint8 private _locked;
 
+    /// @dev Expected Uniswap V3 pool for callback validation.
+    ///      Set before swap, cleared after swap returns.
+    address private _expectedPool;
+
     // ──────────────────────────────────────────────
     //                    EVENTS
     // ──────────────────────────────────────────────
 
     event ArbitrageExecuted(
-        address indexed asset,
-        uint256 amount,
+        address indexed uniPool,
+        address indexed aeroPool,
+        uint256 amountBorrowed,
         uint256 profit,
-        address indexed targetToken,
-        uint24 fee1,
-        uint24 fee2,
         uint256 timestamp
     );
     event OwnershipTransferStarted(address indexed from, address indexed to);
@@ -167,21 +191,11 @@ contract ArbitrajBotu is FlashLoanSimpleReceiverBase {
     //                  CONSTRUCTOR
     // ──────────────────────────────────────────────
 
-    /// @param _addressProvider Aave V3 PoolAddressesProvider
-    /// @param _swapRouter      Uniswap V3 SwapRouter
-    /// @param _minProfitBps    Minimum profit in basis points (0 = no check)
-    constructor(
-        address _addressProvider,
-        address _swapRouter,
-        uint256 _minProfitBps
-    ) FlashLoanSimpleReceiverBase(IPoolAddressesProvider(_addressProvider)) {
-        if (_swapRouter == address(0)) revert ZeroAddress();
-
+    /// @param _minProfitBps Minimum profit in basis points (0 = no check)
+    constructor(uint256 _minProfitBps) {
         owner = msg.sender;
-        SWAP_ROUTER = ISwapRouter(_swapRouter);
         minProfitBps = _minProfitBps;
         _locked = 1;
-
         emit OwnershipTransferred(address(0), msg.sender);
     }
 
@@ -189,129 +203,160 @@ contract ArbitrajBotu is FlashLoanSimpleReceiverBase {
     //            CORE — ARBITRAGE TRIGGER
     // ══════════════════════════════════════════════
 
-    /// @notice Initiates a flash-loan arbitrage between two Uniswap V3
-    ///         fee-tier pools.
+    /// @notice Initiates a flash swap arbitrage:
+    ///         Borrow from Uniswap V3 → Sell on Aerodrome → Repay → Profit.
     /// @dev    Called by the off-chain Rust bot when a profitable
     ///         opportunity is detected.
-    /// @param asset                The token to borrow (e.g. USDC)
-    /// @param amount               Borrow amount in the token's smallest unit
-    /// @param targetToken          Intermediate token (e.g. WETH)
-    /// @param fee1                 Fee tier for Swap 1: asset → targetToken
-    /// @param fee2                 Fee tier for Swap 2: targetToken → asset
-    /// @param minAmountIntermediate Minimum output for Swap 1 (slippage guard)
-    /// @param minAmountFinal       Minimum output for Swap 2 (slippage guard)
+    /// @param uniPool           Uniswap V3 pool address (flash swap source)
+    /// @param aeroPool          Aerodrome pool address (second leg, profit realization)
+    /// @param zeroForOne        Swap direction on Uniswap V3
+    ///                          true  = token0 → token1 (receive token1, owe token0)
+    ///                          false = token1 → token0 (receive token0, owe token1)
+    /// @param amountSpecified   Amount for Uni V3 swap
+    ///                          positive = exact input, negative = exact output
+    /// @param sqrtPriceLimitX96 Price limit for Uni V3 swap
+    /// @param minProfit         Minimum absolute profit in the owed token
     function executeArbitrage(
-        address asset,
-        uint256 amount,
-        address targetToken,
-        uint24 fee1,
-        uint24 fee2,
-        uint256 minAmountIntermediate,
-        uint256 minAmountFinal
+        address uniPool,
+        address aeroPool,
+        bool zeroForOne,
+        int256 amountSpecified,
+        uint160 sqrtPriceLimitX96,
+        uint256 minProfit
     ) external onlyOwner whenNotPaused nonReentrant {
-        if (amount == 0) revert ZeroAmount();
-        if (asset == address(0) || targetToken == address(0)) revert ZeroAddress();
-        if (!_isValidFeeTier(fee1) || !_isValidFeeTier(fee2)) revert InvalidFeeTier();
-        if (enforceSlippage && (minAmountIntermediate == 0 || minAmountFinal == 0)) revert SlippageNotSet();
+        if (uniPool == address(0) || aeroPool == address(0)) revert ZeroAddress();
+        if (amountSpecified == 0) revert ZeroAmount();
+        if (enforceSlippage && minProfit == 0) revert SlippageNotSet();
 
-        bytes memory params = abi.encode(
-            targetToken,
-            fee1,
-            fee2,
-            minAmountIntermediate,
-            minAmountFinal
+        // Set expected pool for callback validation
+        _expectedPool = uniPool;
+
+        bytes memory data = abi.encode(aeroPool, minProfit);
+
+        IUniswapV3Pool(uniPool).swap(
+            address(this),
+            zeroForOne,
+            amountSpecified,
+            sqrtPriceLimitX96,
+            data
         );
 
-        POOL.flashLoanSimple(address(this), asset, amount, params, 0);
+        // Clear after swap completes (callback already executed)
+        _expectedPool = address(0);
     }
 
     // ══════════════════════════════════════════════
-    //         CORE — FLASH-LOAN CALLBACK
+    //       CORE — UNISWAP V3 FLASH SWAP CALLBACK
     // ══════════════════════════════════════════════
 
-    /// @notice Aave calls this after depositing funds. Executes the
-    ///         dual-swap arbitrage and validates profit.
-    function executeOperation(
-        address asset,
-        uint256 amount,
-        uint256 premium,
-        address initiator,
-        bytes calldata params
-    ) external override returns (bool) {
-        // ── Security ───────────────────────────────
-        if (msg.sender != address(POOL)) revert OnlyPool();
-        if (initiator != address(this)) revert InvalidInitiator();
+    /// @notice Called by Uniswap V3 pool during swap execution.
+    ///         Executes the Aerodrome leg, validates profit, repays debt.
+    /// @dev    Positive delta = amount owed TO the pool by this contract
+    ///         Negative delta = amount sent FROM the pool to this contract
+    /// @param amount0Delta Amount of token0 owed (+) or received (-)
+    /// @param amount1Delta Amount of token1 owed (+) or received (-)
+    /// @param data         Encoded (aeroPool, minProfit)
+    function uniswapV3SwapCallback(
+        int256 amount0Delta,
+        int256 amount1Delta,
+        bytes calldata data
+    ) external {
+        // ── Security: only the expected Uniswap V3 pool may call ──
+        if (msg.sender != _expectedPool) revert InvalidCaller();
 
-        // ── Decode route parameters ────────────────
-        (
-            address targetToken,
-            uint24 fee1,
-            uint24 fee2,
-            uint256 minAmountIntermediate,
-            uint256 minAmountFinal
-        ) = abi.decode(params, (address, uint24, uint24, uint256, uint256));
+        // ── Decode parameters ──
+        (address aeroPool, uint256 minProfit) = abi.decode(data, (address, uint256));
 
-        uint256 totalDebt = amount + premium;
+        // ── Identify tokens and amounts ──
+        IUniswapV3Pool uniPool = IUniswapV3Pool(msg.sender);
+        address token0 = uniPool.token0();
+        address token1 = uniPool.token1();
 
-        // ── SWAP 1: asset → targetToken ────────────
-        _safeApprove(asset, address(SWAP_ROUTER), amount);
+        address tokenOwed;      // Token we must pay back to Uniswap V3
+        address tokenReceived;  // Token we received from Uniswap V3
+        uint256 amountOwed;
+        uint256 amountReceived;
 
-        uint256 intermediateAmount = SWAP_ROUTER.exactInputSingle(
-            ISwapRouter.ExactInputSingleParams({
-                tokenIn:           asset,
-                tokenOut:          targetToken,
-                fee:               fee1,
-                recipient:         address(this),
-                deadline:          block.timestamp,
-                amountIn:          amount,
-                amountOutMinimum:  minAmountIntermediate,
-                sqrtPriceLimitX96: 0
-            })
-        );
-
-        // ── SWAP 2: targetToken → asset ────────────
-        _safeApprove(targetToken, address(SWAP_ROUTER), intermediateAmount);
-
-        SWAP_ROUTER.exactInputSingle(
-            ISwapRouter.ExactInputSingleParams({
-                tokenIn:           targetToken,
-                tokenOut:          asset,
-                fee:               fee2,
-                recipient:         address(this),
-                deadline:          block.timestamp,
-                amountIn:          intermediateAmount,
-                amountOutMinimum:  minAmountFinal,
-                sqrtPriceLimitX96: 0
-            })
-        );
-
-        // ── Profit validation ──────────────────────
-        uint256 currentBalance = IERC20(asset).balanceOf(address(this));
-
-        if (currentBalance < totalDebt) {
-            revert InsufficientProfit(totalDebt, currentBalance);
+        if (amount0Delta > 0) {
+            // Owe token0 to pool, received token1
+            tokenOwed = token0;
+            tokenReceived = token1;
+            amountOwed = uint256(amount0Delta);
+            amountReceived = uint256(-amount1Delta);
+        } else {
+            // Owe token1 to pool, received token0
+            tokenOwed = token1;
+            tokenReceived = token0;
+            amountOwed = uint256(amount1Delta);
+            amountReceived = uint256(-amount0Delta);
         }
 
-        uint256 profit = currentBalance - totalDebt;
-        uint256 minProfit = (amount * minProfitBps) / 10_000;
+        // ── Sell received tokens on Aerodrome ──
+        uint256 balanceBefore = IERC20(tokenOwed).balanceOf(address(this));
+        _aerodromeSwap(aeroPool, tokenReceived, amountReceived, tokenOwed);
+        uint256 balanceAfter = IERC20(tokenOwed).balanceOf(address(this));
 
-        if (profit < minProfit) {
-            revert InsufficientProfit(minProfit, profit);
+        uint256 aeroOut = balanceAfter - balanceBefore;
+
+        // ── Profit validation ──
+        if (aeroOut < amountOwed) {
+            revert InsufficientProfit(amountOwed, aeroOut);
         }
 
-        // ── Repay Aave ─────────────────────────────
-        _safeApprove(asset, address(POOL), totalDebt);
+        uint256 profit = aeroOut - amountOwed;
 
-        // ── Transfer profit to owner ───────────────
+        // Check against both absolute and bps-based minimum
+        uint256 minProfitFromBps = (amountOwed * minProfitBps) / 10_000;
+        uint256 effectiveMinProfit = minProfit > minProfitFromBps
+            ? minProfit
+            : minProfitFromBps;
+
+        if (profit < effectiveMinProfit) {
+            revert InsufficientProfit(effectiveMinProfit, profit);
+        }
+
+        // ── Repay Uniswap V3 pool ──
+        _safeTransfer(tokenOwed, msg.sender, amountOwed);
+
+        // ── Transfer profit to owner ──
         if (profit > 0) {
-            _safeTransfer(asset, owner, profit);
+            _safeTransfer(tokenOwed, owner, profit);
         }
 
         emit ArbitrageExecuted(
-            asset, amount, profit, targetToken, fee1, fee2, block.timestamp
+            msg.sender, aeroPool, amountReceived, profit, block.timestamp
         );
+    }
 
-        return true;
+    // ══════════════════════════════════════════════
+    //        INTERNAL — AERODROME DIRECT SWAP
+    // ══════════════════════════════════════════════
+
+    /// @dev Transfers tokens directly to Aerodrome pool and executes swap.
+    ///      No router, no approve — direct transfer + swap for minimum gas.
+    /// @param pool     Aerodrome pool address
+    /// @param tokenIn  Token to sell
+    /// @param amountIn Amount of tokenIn to sell
+    /// @param tokenOut Token to receive
+    function _aerodromeSwap(
+        address pool,
+        address tokenIn,
+        uint256 amountIn,
+        address tokenOut
+    ) internal {
+        // Transfer input tokens directly to pool (no approve needed)
+        _safeTransfer(tokenIn, pool, amountIn);
+
+        // Query expected output from pool
+        uint256 amountOut = IAerodromePool(pool).getAmountOut(amountIn, tokenIn);
+
+        // Execute swap based on output token position
+        address poolToken0 = IAerodromePool(pool).token0();
+        if (tokenOut == poolToken0) {
+            IAerodromePool(pool).swap(amountOut, 0, address(this), "");
+        } else {
+            IAerodromePool(pool).swap(0, amountOut, address(this), "");
+        }
     }
 
     // ══════════════════════════════════════════════
@@ -327,8 +372,7 @@ contract ArbitrajBotu is FlashLoanSimpleReceiverBase {
     }
 
     /// @notice Toggle slippage enforcement.
-    ///         When enabled, executeArbitrage reverts if
-    ///         minAmountIntermediate or minAmountFinal is 0.
+    ///         When enabled, executeArbitrage reverts if minProfit is 0.
     function setEnforceSlippage(bool _enforce) external onlyOwner {
         enforceSlippage = _enforce;
         emit EnforceSlippageToggled(_enforce, msg.sender);
@@ -389,21 +433,6 @@ contract ArbitrajBotu is FlashLoanSimpleReceiverBase {
     // ══════════════════════════════════════════════
     //              INTERNAL HELPERS
     // ══════════════════════════════════════════════
-
-    /// @dev Validates that a fee tier is one of Uniswap V3's supported values.
-    ///      100  = 0.01 %  (stablecoin pairs)
-    ///      500  = 0.05 %  (stable / blue-chip)
-    ///      3000 = 0.30 %  (most pairs)
-    ///      10000 = 1.00 % (exotic / low-liquidity)
-    function _isValidFeeTier(uint24 fee) internal pure returns (bool) {
-        return fee == 100 || fee == 500 || fee == 3000 || fee == 10000;
-    }
-
-    /// @dev Reset approval to 0 then set — safe for tokens like USDT
-    function _safeApprove(address token, address spender, uint256 amt) internal {
-        IERC20(token).approve(spender, 0);
-        IERC20(token).approve(spender, amt);
-    }
 
     /// @dev Transfer with explicit success check
     function _safeTransfer(address token, address to, uint256 amt) internal {
