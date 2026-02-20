@@ -1,46 +1,88 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.20;
+pragma solidity ^0.8.27;
 
-// ══════════════════════════════════════════════════════════════
-//                        CUSTOM ERRORS
-// ══════════════════════════════════════════════════════════════
+// ══════════════════════════════════════════════════════════════════════════════
+//
+//   ARBITRAJ BOTU v7.0 — "Kuantum Mermi" Kontratı
+//   Base Network — Gas-Minimized Flash Swap Arbitrage Engine
+//
+//   4 Devasa Mimari Değişiklik:
+//
+//   1. SAF CALLDATA OKUMASI (Assembly)
+//      • Fonksiyon parametresi YOK — fallback() ile giriş
+//      • calldataload ile ham byte okuması (73 byte kompakt format)
+//      • Memory tahsisi SIFIR — stack üzerinde çalışır
+//
+//   2. EIP-1153 TRANSIENT STORAGE (Callback Yönetimi)
+//      • TSTORE/TLOAD ile geçici hafıza — SSTORE maliyetinin ~%95 altında
+//      • Callback bağlamı (expectedPool, aeroPool, token'lar) anlık yazılır
+//      • TX bittiğinde otomatik silinir — gas iadesi
+//
+//   3. OFF-CHAIN KÂR DOĞRULAMASI
+//      • Kontrat içinde matematik YOK — REVM botu %100 simüle eder
+//      • Sadece "Bakiye Öncesi vs Bakiye Sonrası" kontrolü
+//      • Son Bakiye > İlk Bakiye ise → kâr sahibine gönderilir
+//      • Değilse → tüm işlem revert edilir
+//
+//   4. IMMUTABLE DEĞİŞKENLER
+//      • owner bytecode'a gömülü — SLOAD (2100 gas) yerine ~3 gas
+//      • paused, enforceSlippage, minProfitBps → SİLİNDİ
+//      • Botu durdurmak istiyorsan Rust'ı kapatırsın, kontratı değil
+//
+// ══════════════════════════════════════════════════════════════════════════════
+//
+//   KOMPAKT CALLDATA FORMATI (73 byte — ABI kodlama YOK)
+//
+//   Offset   Boyut   Alan
+//   ─────────────────────────────────
+//   0x00     20 B    Pool A adresi (Uniswap V3 — flash swap kaynağı)
+//   0x14     20 B    Pool B adresi (Aerodrome — satış hedefi)
+//   0x28     32 B    Miktar (uint256, big-endian)
+//   0x48      1 B    Yön (0x00 = zeroForOne=true, 0x01 = false)
+//   ─────────────────────────────────
+//   TOPLAM   73 B    (Eski ABI: 132+ byte → %45 tasarruf)
+//
+// ══════════════════════════════════════════════════════════════════════════════
+//
+//   EIP-1153 TRANSIENT STORAGE SLOT HARİTASI
+//
+//   Slot     İçerik
+//   ─────────────────────────
+//   0x00     expectedPool   — callback çağrıcı doğrulaması
+//   0x01     aeroPool       — ikinci ayak (satış) havuzu
+//   0x02     token0         — Uniswap V3 havuz token0
+//   0x03     token1         — Uniswap V3 havuz token1
+//   0xFF     reentrancy     — kilit (1 = kilitli, 0 = açık)
+//
+// ══════════════════════════════════════════════════════════════════════════════
 
-/// @dev Caller is not authorized
+// ── CUSTOM ERRORS ────────────────────────────────────────────────────────────
+
+/// @dev Çağrıcı yetkili değil (owner değil)
 error Unauthorized();
-/// @dev Callback caller is not the expected Uniswap V3 pool
-error InvalidCaller();
-/// @dev Contract is paused
-error ContractPaused();
-/// @dev Reentrancy detected
-error ReentrancyGuard();
-/// @dev Insufficient profit after arbitrage
-error InsufficientProfit(uint256 required, uint256 actual);
-/// @dev Amount must be > 0
-error ZeroAmount();
-/// @dev Address must not be zero
-error ZeroAddress();
-/// @dev ERC20 transfer failed
-error TransferFailed();
-/// @dev Slippage protection: minProfit must be > 0 when enforced
-error SlippageNotSet();
 
-// ══════════════════════════════════════════════════════════════
-//                       MINIMAL IERC20
-// ══════════════════════════════════════════════════════════════
+/// @dev Callback çağrıcısı beklenen Uniswap V3 havuzu değil
+error InvalidCaller();
+
+/// @dev Arbitraj sonrası kâr elde edilemedi (bakiye artmadı)
+error NoProfitRealized();
+
+/// @dev Reentrancy tespit edildi (transient storage kilidi)
+error Locked();
+
+/// @dev İşlem miktarı sıfır
+error ZeroAmount();
+
+/// @dev ERC20 transfer başarısız
+error TransferFailed();
+
+// ── MINIMAL INTERFACES ───────────────────────────────────────────────────────
 
 interface IERC20 {
     function balanceOf(address account) external view returns (uint256);
     function transfer(address to, uint256 amount) external returns (bool);
 }
 
-// ══════════════════════════════════════════════════════════════
-//                  UNISWAP V3 POOL INTERFACE
-// ══════════════════════════════════════════════════════════════
-
-/// @title IUniswapV3Pool — Direct pool-level interaction (NO router)
-/// @dev   Flash swap kaynağı. swap() çağrıldığında output token'lar
-///        önce gönderilir, ardından uniswapV3SwapCallback çağrılarak
-///        ödeme talep edilir. Bu mekanizma EVM'deki en ucuz borçlanma yöntemidir.
 interface IUniswapV3Pool {
     function swap(
         address recipient,
@@ -52,16 +94,8 @@ interface IUniswapV3Pool {
 
     function token0() external view returns (address);
     function token1() external view returns (address);
-    function fee() external view returns (uint24);
 }
 
-// ══════════════════════════════════════════════════════════════
-//                  AERODROME POOL INTERFACE
-// ══════════════════════════════════════════════════════════════
-
-/// @title IAerodromePool — Direct pool-level interaction (V2-style AMM)
-/// @dev   Arbitrajın ikinci ayağı. Uniswap'tan alınan token burada
-///        daha pahalıya satılır, elde edilen token ile Uniswap borcu ödenir.
 interface IAerodromePool {
     function swap(
         uint256 amount0Out,
@@ -76,281 +110,275 @@ interface IAerodromePool {
     ) external view returns (uint256);
 
     function token0() external view returns (address);
-    function token1() external view returns (address);
 }
 
-// ══════════════════════════════════════════════════════════════
-//                       MAIN CONTRACT
-// ══════════════════════════════════════════════════════════════
+// ══════════════════════════════════════════════════════════════════════════════
+//                            ANA KONTRAT
+// ══════════════════════════════════════════════════════════════════════════════
 
-/// @title  ArbitrajBotu — Gas-Optimized Flash Swap Arbitrage Engine
-/// @notice Executes atomic arbitrage between Uniswap V3 and Aerodrome
-///         using Uniswap V3 flash swaps (zero-capital). No routers,
-///         no Aave — direct pool-to-pool for minimum gas.
-///
-/// @dev    Architecture:
-///           1. IUniswapV3Pool.swap() → receive tokens (flash swap)
-///           2. uniswapV3SwapCallback() →
-///              a. Sell received tokens on Aerodrome (direct pool call)
-///              b. Pay Uniswap V3 pool debt
-///              c. Transfer profit to owner
-///
-///         Security:
-///           • Owner-only execution with 2-step ownership transfer
-///           • Reentrancy guard on every external entry point
-///           • Flash swap callback caller validation (_expectedPool)
-///           • Configurable minimum-profit threshold (bps + absolute)
-///           • Emergency pause + token / ETH rescue
 contract ArbitrajBotu {
 
-    // ──────────────────────────────────────────────
-    //                STATE VARIABLES
-    // ──────────────────────────────────────────────
+    // ─────────────────────────────────────────────────────────────────────────
+    //  IMMUTABLE — bytecode'a gömülü, SLOAD = 0 gas
+    // ─────────────────────────────────────────────────────────────────────────
 
-    /// @notice Current contract owner
-    address public owner;
+    /// @notice Kontrat sahibi. Constructor'da atanır, değiştirilemez.
+    ///         Bytecode'da saklanır → okuma maliyeti ~3 gas (SLOAD: 2100 gas).
+    address public immutable owner;
 
-    /// @notice Pending owner for 2-step transfer
-    address public pendingOwner;
+    // ─────────────────────────────────────────────────────────────────────────
+    //  CONSTANTS — Uniswap V3 sqrt price limits
+    // ─────────────────────────────────────────────────────────────────────────
 
-    /// @notice Minimum acceptable profit in basis points (1 bp = 0.01 %)
-    ///         Set to 0 only in test environments.
-    uint256 public minProfitBps;
+    /// @dev zeroForOne=true → minimum fiyat sınırı (TickMath.MIN_SQRT_RATIO + 1)
+    uint160 private constant MIN_SQRT_RATIO_PLUS_1 = 4295128740;
 
-    /// @notice When true, minProfit parameter in executeArbitrage
-    ///         must be > 0 to prevent sandwich attacks.
-    bool public enforceSlippage;
+    /// @dev zeroForOne=false → maksimum fiyat sınırı (TickMath.MAX_SQRT_RATIO - 1)
+    uint160 private constant MAX_SQRT_RATIO_MINUS_1 =
+        1461446703485210103287273052203988822378723970341;
 
-    /// @notice Emergency pause flag
-    bool public paused;
-
-    /// @dev Reentrancy lock: 1 = unlocked, 2 = locked
-    uint8 private _locked;
-
-    /// @dev Expected Uniswap V3 pool for callback validation.
-    ///      Set before swap, cleared after swap returns.
-    address private _expectedPool;
-
-    // ──────────────────────────────────────────────
-    //                    EVENTS
-    // ──────────────────────────────────────────────
+    // ─────────────────────────────────────────────────────────────────────────
+    //  EVENTS
+    // ─────────────────────────────────────────────────────────────────────────
 
     event ArbitrageExecuted(
-        address indexed uniPool,
-        address indexed aeroPool,
-        uint256 amountBorrowed,
-        uint256 profit,
-        uint256 timestamp
+        address indexed poolA,
+        address indexed poolB,
+        uint256 amountIn,
+        uint256 profit
     );
-    event OwnershipTransferStarted(address indexed from, address indexed to);
-    event OwnershipTransferred(address indexed from, address indexed to);
-    event PauseToggled(bool isPaused, address indexed by);
-    event MinProfitBpsUpdated(uint256 oldBps, uint256 newBps);
-    event EnforceSlippageToggled(bool enforced, address indexed by);
-    event EmergencyTokenWithdraw(address indexed token, uint256 amount, address indexed to);
+    event EmergencyTokenWithdraw(
+        address indexed token, uint256 amount, address indexed to
+    );
     event EmergencyETHWithdraw(uint256 amount, address indexed to);
 
-    // ──────────────────────────────────────────────
-    //                   MODIFIERS
-    // ──────────────────────────────────────────────
+    // ─────────────────────────────────────────────────────────────────────────
+    //  CONSTRUCTOR — owner immutable olarak bytecode'a yazılır
+    // ─────────────────────────────────────────────────────────────────────────
 
-    modifier onlyOwner() {
-        _checkOwner();
-        _;
-    }
-
-    modifier whenNotPaused() {
-        _checkNotPaused();
-        _;
-    }
-
-    modifier nonReentrant() {
-        _nonReentrantBefore();
-        _;
-        _nonReentrantAfter();
-    }
-
-    function _checkOwner() internal view {
-        if (msg.sender != owner) revert Unauthorized();
-    }
-
-    function _checkNotPaused() internal view {
-        if (paused) revert ContractPaused();
-    }
-
-    function _nonReentrantBefore() internal {
-        if (_locked == 2) revert ReentrancyGuard();
-        _locked = 2;
-    }
-
-    function _nonReentrantAfter() internal {
-        _locked = 1;
-    }
-
-    // ──────────────────────────────────────────────
-    //                  CONSTRUCTOR
-    // ──────────────────────────────────────────────
-
-    /// @param _minProfitBps Minimum profit in basis points (0 = no check)
-    constructor(uint256 _minProfitBps) {
+    constructor() {
         owner = msg.sender;
-        minProfitBps = _minProfitBps;
-        _locked = 1;
-        emit OwnershipTransferred(address(0), msg.sender);
     }
 
-    // ══════════════════════════════════════════════
-    //            CORE — ARBITRAGE TRIGGER
-    // ══════════════════════════════════════════════
+    // ═════════════════════════════════════════════════════════════════════════
+    //  CORE GİRİŞ NOKTASI — 73-BYTE KOMPAKT CALLDATA (fallback)
+    // ═════════════════════════════════════════════════════════════════════════
+    //
+    //  Rust botu 73 byte sıkıştırılmış veriyi gönderir:
+    //    [PoolA:20B] + [PoolB:20B] + [Miktar:32B] + [Yön:1B]
+    //
+    //  • Fonksiyon seçici YOK — fallback() devralır
+    //  • ABI kodlama YOK — calldataload ile ham byte okuması
+    //  • Memory tahsisi SIFIR — tüm değişkenler stack'te
+    //
+    //  Akış:
+    //    1. Owner kontrolü (immutable — bytecode, ~3 gas)
+    //    2. Reentrancy kilidi (TSTORE — geçici hafıza)
+    //    3. Calldata çözümleme (assembly — calldataload)
+    //    4. Havuz token'larını oku (2 static call)
+    //    5. TSTORE callback bağlamı (EIP-1153)
+    //    6. Bakiye oku (ÖNCE)
+    //    7. Flash swap tetikle → callback → Aerodrome → geri öde
+    //    8. Bakiye oku (SONRA) — Off-chain doğrulama
+    //    9. Kâr varsa sahibine gönder, yoksa revert
+    //
+    // ═════════════════════════════════════════════════════════════════════════
 
-    /// @notice Initiates a flash swap arbitrage:
-    ///         Borrow from Uniswap V3 → Sell on Aerodrome → Repay → Profit.
-    /// @dev    Called by the off-chain Rust bot when a profitable
-    ///         opportunity is detected.
-    /// @param uniPool           Uniswap V3 pool address (flash swap source)
-    /// @param aeroPool          Aerodrome pool address (second leg, profit realization)
-    /// @param zeroForOne        Swap direction on Uniswap V3
-    ///                          true  = token0 → token1 (receive token1, owe token0)
-    ///                          false = token1 → token0 (receive token0, owe token1)
-    /// @param amountSpecified   Amount for Uni V3 swap
-    ///                          positive = exact input, negative = exact output
-    /// @param sqrtPriceLimitX96 Price limit for Uni V3 swap
-    /// @param minProfit         Minimum absolute profit in the owed token
-    function executeArbitrage(
-        address uniPool,
-        address aeroPool,
-        bool zeroForOne,
-        int256 amountSpecified,
-        uint160 sqrtPriceLimitX96,
-        uint256 minProfit
-    ) external onlyOwner whenNotPaused nonReentrant {
-        if (uniPool == address(0) || aeroPool == address(0)) revert ZeroAddress();
-        if (amountSpecified == 0) revert ZeroAmount();
-        if (enforceSlippage && minProfit == 0) revert SlippageNotSet();
+    fallback() external {
+        // ── 1. SAHİPLİK KONTROLÜ ─────────────────────────────────────────
+        // Immutable → bytecode'dan okunur → SLOAD yerine PUSH, ~3 gas
+        if (msg.sender != owner) revert Unauthorized();
 
-        // Set expected pool for callback validation
-        _expectedPool = uniPool;
+        // ── 2. REENTRANCY KİLİDİ (EIP-1153 Transient Storage) ────────────
+        // TLOAD/TSTORE: ~100 gas (SLOAD/SSTORE: 2100/5000+ gas)
+        // TX bittiğinde otomatik sıfırlanır → gas iadesi alınır
+        uint256 locked;
+        assembly { locked := tload(0xFF) }
+        if (locked != 0) revert Locked();
+        assembly { tstore(0xFF, 1) }
 
-        bytes memory data = abi.encode(aeroPool, minProfit);
+        // ── 3. CALLDATA ÇÖZÜMLEME (Assembly — saf byte okuması) ──────────
+        // calldataload(offset): offset'ten 32 byte okur
+        // shr(96, x): sağa 96 bit kaydır → üst 20 byte = adres
+        // shr(248, x): sağa 248 bit kaydır → üst 1 byte = yön
+        address poolA;
+        address poolB;
+        uint256 amount;
+        uint8 direction;
 
-        IUniswapV3Pool(uniPool).swap(
-            address(this),
-            zeroForOne,
-            amountSpecified,
-            sqrtPriceLimitX96,
-            data
+        assembly {
+            poolA     := shr(96,  calldataload(0x00))  // [0..20]   Pool A adresi
+            poolB     := shr(96,  calldataload(0x14))  // [20..40]  Pool B adresi
+            amount    := calldataload(0x28)             // [40..72]  Miktar (uint256)
+            direction := shr(248, calldataload(0x48))   // [72]      Yön (1 byte)
+        }
+
+        if (amount == 0) revert ZeroAmount();
+
+        // ── 4. HAVUZ TOKEN'LARINI OKU ────────────────────────────────────
+        // 2 static call (kaçınılmaz — ama sadece 1 kez, ~5200 gas toplam)
+        address t0 = IUniswapV3Pool(poolA).token0();
+        address t1 = IUniswapV3Pool(poolA).token1();
+
+        // Swap yönü: direction=0 → zeroForOne=true (token0 borçlu, token1 alınır)
+        //            direction=1 → zeroForOne=false (token1 borçlu, token0 alınır)
+        bool zeroForOne = (direction == 0);
+
+        // Borçlu token = kâr token (flash swap'tan sonra artması gereken)
+        address owedToken = zeroForOne ? t0 : t1;
+
+        // ── 5. TSTORE — Callback bağlamını geçici hafızaya yaz ───────────
+        // Bu değerler callback içinde TLOAD ile okunacak.
+        // TX bittiğinde otomatik silinir → gas iadesi.
+        assembly {
+            tstore(0x00, poolA)   // Slot 0: expectedPool (callback güvenliği)
+            tstore(0x01, poolB)   // Slot 1: aeroPool (ikinci ayak)
+            tstore(0x02, t0)      // Slot 2: token0
+            tstore(0x03, t1)      // Slot 3: token1
+        }
+
+        // ── 6. BAKİYE KONTROLÜ — ÖNCE ───────────────────────────────────
+        // Off-chain doğrulama: REVM botu zaten %100 simüle etti.
+        // Kontrat sadece nihai güvenlik kilidi: bakiye arttı mı?
+        uint256 balBefore = IERC20(owedToken).balanceOf(address(this));
+
+        // ── 7. FLASH SWAP TETİKLE ────────────────────────────────────────
+        // Uniswap V3 flash swap: token'lar ÖNCE gönderilir,
+        // sonra uniswapV3SwapCallback tetiklenir, biz borcu öderiz.
+        // data parametresi BOŞ — callback TLOAD kullanır (gas tasarrufu).
+        uint160 priceLimit = zeroForOne
+            ? MIN_SQRT_RATIO_PLUS_1
+            : MAX_SQRT_RATIO_MINUS_1;
+
+        IUniswapV3Pool(poolA).swap(
+            address(this),       // recipient: biz
+            zeroForOne,          // swap yönü
+            // forge-lint: disable-next-line(unsafe-typecast)
+            int256(amount),      // exact input
+            priceLimit,          // fiyat sınırı
+            ""                   // data: BOŞ (TLOAD kullanılır)
         );
 
-        // Clear after swap completes (callback already executed)
-        _expectedPool = address(0);
+        // ── 8. BAKİYE KONTROLÜ — SONRA (Off-Chain Doğrulama) ────────────
+        // Tüm callback'ler tamamlandı. Flash swap atomik.
+        // Tek soru: bakiye arttı mı?
+        uint256 balAfter = IERC20(owedToken).balanceOf(address(this));
+        if (balAfter <= balBefore) revert NoProfitRealized();
+
+        uint256 profit = balAfter - balBefore;
+
+        // ── 9. KÂRI SAHİBE GÖNDER ───────────────────────────────────────
+        _safeTransfer(owedToken, owner, profit);
+
+        // ── 10. TRANSIENT STORAGE TEMİZLİĞİ + EVENT ──────────────────
+        // EIP-1153: Transient storage TX sonunda otomatik sıfırlanır AMA
+        // aynı TX içinde birden fazla çağrı senaryosunda (composability)
+        // eski değerler kalabilir. Tüm slot'ları explicit temizliyoruz.
+        assembly {
+            tstore(0x00, 0)  // expectedPool
+            tstore(0x01, 0)  // aeroPool
+            tstore(0x02, 0)  // token0
+            tstore(0x03, 0)  // token1
+            tstore(0xFF, 0)  // reentrancy kilidi
+        }
+
+        emit ArbitrageExecuted(poolA, poolB, amount, profit);
     }
 
-    // ══════════════════════════════════════════════
-    //       CORE — UNISWAP V3 FLASH SWAP CALLBACK
-    // ══════════════════════════════════════════════
+    // ═════════════════════════════════════════════════════════════════════════
+    //  CALLBACK — Uniswap V3 Flash Swap Geri Çağrısı
+    // ═════════════════════════════════════════════════════════════════════════
+    //
+    //  Uniswap V3 havuzu swap() sırasında bu fonksiyonu tetikler.
+    //  Akış:
+    //    1. TLOAD ile beklenen havuz doğrulaması (güvenlik)
+    //    2. TLOAD ile aeroPool ve token adresleri oku
+    //    3. Alınan token'ları Aerodrome'da sat (doğrudan havuz çağrısı)
+    //    4. Borcu Uniswap V3'e geri öde
+    //    5. Kâr kontratta kalır → fallback() kontrol eder ve sahibine gönderir
+    //
+    // ═════════════════════════════════════════════════════════════════════════
 
-    /// @notice Called by Uniswap V3 pool during swap execution.
-    ///         Executes the Aerodrome leg, validates profit, repays debt.
-    /// @dev    Positive delta = amount owed TO the pool by this contract
-    ///         Negative delta = amount sent FROM the pool to this contract
-    /// @param amount0Delta Amount of token0 owed (+) or received (-)
-    /// @param amount1Delta Amount of token1 owed (+) or received (-)
-    /// @param data         Encoded (aeroPool, minProfit)
     function uniswapV3SwapCallback(
         int256 amount0Delta,
         int256 amount1Delta,
-        bytes calldata data
+        bytes calldata /* data — kullanılmıyor, TLOAD kullanılıyor */
     ) external {
-        // ── Security: only the expected Uniswap V3 pool may call ──
-        if (msg.sender != _expectedPool) revert InvalidCaller();
+        // ── GÜVENLİK: Sadece beklenen havuz çağırabilir (TLOAD) ──────────
+        // Normal storage okuması: SLOAD = 2100 gas
+        // Transient okuması:      TLOAD = 100 gas → %95 tasarruf
+        address expectedPool;
+        address aeroPool;
+        address token0;
+        address token1;
 
-        // ── Decode parameters ──
-        (address aeroPool, uint256 minProfit) = abi.decode(data, (address, uint256));
+        assembly {
+            expectedPool := tload(0x00)
+            aeroPool     := tload(0x01)
+            token0       := tload(0x02)
+            token1       := tload(0x03)
+        }
 
-        // ── Identify tokens and amounts ──
-        IUniswapV3Pool uniPool = IUniswapV3Pool(msg.sender);
-        address token0 = uniPool.token0();
-        address token1 = uniPool.token1();
+        if (msg.sender != expectedPool) revert InvalidCaller();
 
-        address tokenOwed;      // Token we must pay back to Uniswap V3
-        address tokenReceived;  // Token we received from Uniswap V3
+        // ── BORÇLU ve ALINAN MİKTARLARI BELİRLE ─────────────────────────
+        // amount0Delta > 0 → biz havuza token0 borçluyuz (ödememiz lazım)
+        // amount1Delta < 0 → havuz bize token1 gönderdi (aldığımız)
+        address tokenOwed;
+        address tokenReceived;
         uint256 amountOwed;
         uint256 amountReceived;
 
         if (amount0Delta > 0) {
-            // Owe token0 to pool, received token1
-            tokenOwed = token0;
-            tokenReceived = token1;
-            amountOwed = uint256(amount0Delta);
+            // token0 borçlu, token1 alındı
+            tokenOwed      = token0;
+            tokenReceived  = token1;
+            // forge-lint: disable-next-line(unsafe-typecast)
+            amountOwed     = uint256(amount0Delta);
+            // forge-lint: disable-next-line(unsafe-typecast)
             amountReceived = uint256(-amount1Delta);
         } else {
-            // Owe token1 to pool, received token0
-            tokenOwed = token1;
-            tokenReceived = token0;
-            amountOwed = uint256(amount1Delta);
+            // token1 borçlu, token0 alındı
+            tokenOwed      = token1;
+            tokenReceived  = token0;
+            // forge-lint: disable-next-line(unsafe-typecast)
+            amountOwed     = uint256(amount1Delta);
+            // forge-lint: disable-next-line(unsafe-typecast)
             amountReceived = uint256(-amount0Delta);
         }
 
-        // ── Sell received tokens on Aerodrome ──
-        uint256 balanceBefore = IERC20(tokenOwed).balanceOf(address(this));
+        // ── AERODROME'DA SAT (Direct Pool Call — Router YOK) ─────────────
+        // Alınan token'ları Aerodrome havuzuna gönder, karşılığında
+        // borçlu token al. Router kullanmıyoruz = daha az gas.
         _aerodromeSwap(aeroPool, tokenReceived, amountReceived, tokenOwed);
-        uint256 balanceAfter = IERC20(tokenOwed).balanceOf(address(this));
 
-        uint256 aeroOut = balanceAfter - balanceBefore;
-
-        // ── Profit validation ──
-        if (aeroOut < amountOwed) {
-            revert InsufficientProfit(amountOwed, aeroOut);
-        }
-
-        uint256 profit = aeroOut - amountOwed;
-
-        // Check against both absolute and bps-based minimum
-        uint256 minProfitFromBps = (amountOwed * minProfitBps) / 10_000;
-        uint256 effectiveMinProfit = minProfit > minProfitFromBps
-            ? minProfit
-            : minProfitFromBps;
-
-        if (profit < effectiveMinProfit) {
-            revert InsufficientProfit(effectiveMinProfit, profit);
-        }
-
-        // ── Repay Uniswap V3 pool ──
+        // ── UNİSWAP V3 BORCUNU ÖDE ──────────────────────────────────────
         _safeTransfer(tokenOwed, msg.sender, amountOwed);
 
-        // ── Transfer profit to owner ──
-        if (profit > 0) {
-            _safeTransfer(tokenOwed, owner, profit);
-        }
-
-        emit ArbitrageExecuted(
-            msg.sender, aeroPool, amountReceived, profit, block.timestamp
-        );
+        // Kâr kontratta kalır → fallback() bakiye farkını hesaplar
+        // ve sahibine gönderir. Burada ek kontrol yapılmaz.
+        // "Off-chain doğrulama" felsefesi: REVM zaten hesapladı.
     }
 
-    // ══════════════════════════════════════════════
-    //        INTERNAL — AERODROME DIRECT SWAP
-    // ══════════════════════════════════════════════
+    // ═════════════════════════════════════════════════════════════════════════
+    //  INTERNAL — Aerodrome Doğrudan Swap (Router YOK)
+    // ═════════════════════════════════════════════════════════════════════════
 
-    /// @dev Transfers tokens directly to Aerodrome pool and executes swap.
-    ///      No router, no approve — direct transfer + swap for minimum gas.
-    /// @param pool     Aerodrome pool address
-    /// @param tokenIn  Token to sell
-    /// @param amountIn Amount of tokenIn to sell
-    /// @param tokenOut Token to receive
+    /// @dev Token'ları doğrudan Aerodrome havuzuna transfer et ve swap yap.
+    ///      Approve yok, router yok — transfer + swap = minimum gas.
     function _aerodromeSwap(
         address pool,
         address tokenIn,
         uint256 amountIn,
         address tokenOut
     ) internal {
-        // Transfer input tokens directly to pool (no approve needed)
+        // Token'ları doğrudan havuza aktar (approve gerekmez)
         _safeTransfer(tokenIn, pool, amountIn);
 
-        // Query expected output from pool
+        // Beklenen çıktıyı sor (view call)
         uint256 amountOut = IAerodromePool(pool).getAmountOut(amountIn, tokenIn);
 
-        // Execute swap based on output token position
+        // Swap: çıktı token'ın pozisyonuna göre amount0Out veya amount1Out
         address poolToken0 = IAerodromePool(pool).token0();
         if (tokenOut == poolToken0) {
             IAerodromePool(pool).swap(amountOut, 0, address(this), "");
@@ -359,61 +387,27 @@ contract ArbitrajBotu {
         }
     }
 
-    // ══════════════════════════════════════════════
-    //              ADMIN FUNCTIONS
-    // ══════════════════════════════════════════════
+    // ═════════════════════════════════════════════════════════════════════════
+    //  ACİL DURUM — Token ve ETH Kurtarma
+    // ═════════════════════════════════════════════════════════════════════════
+    //
+    //  Sıkışan token'ları veya ETH'yi kurtarmak için.
+    //  paused, enforceSlippage, minProfitBps → SİLİNDİ.
+    //  Botu durdurmak istiyorsan Rust'ı kapatırsın.
+    //
 
-    /// @notice Update the minimum-profit threshold
-    /// @param _minProfitBps New value in basis points
-    function setMinProfitBps(uint256 _minProfitBps) external onlyOwner {
-        uint256 old = minProfitBps;
-        minProfitBps = _minProfitBps;
-        emit MinProfitBpsUpdated(old, _minProfitBps);
-    }
-
-    /// @notice Toggle slippage enforcement.
-    ///         When enabled, executeArbitrage reverts if minProfit is 0.
-    function setEnforceSlippage(bool _enforce) external onlyOwner {
-        enforceSlippage = _enforce;
-        emit EnforceSlippageToggled(_enforce, msg.sender);
-    }
-
-    /// @notice Toggle emergency pause
-    function togglePause() external onlyOwner {
-        paused = !paused;
-        emit PauseToggled(paused, msg.sender);
-    }
-
-    /// @notice Step 1 — nominate a new owner
-    function transferOwnership(address _newOwner) external onlyOwner {
-        if (_newOwner == address(0)) revert ZeroAddress();
-        pendingOwner = _newOwner;
-        emit OwnershipTransferStarted(owner, _newOwner);
-    }
-
-    /// @notice Step 2 — new owner accepts
-    function acceptOwnership() external {
-        if (msg.sender != pendingOwner) revert Unauthorized();
-        address prev = owner;
-        owner = msg.sender;
-        pendingOwner = address(0);
-        emit OwnershipTransferred(prev, msg.sender);
-    }
-
-    /// @notice Rescue stuck ERC-20 tokens
-    /// @param token Token address
-    /// @param amount Amount to withdraw (0 = full balance)
-    function emergencyWithdrawToken(address token, uint256 amount) external onlyOwner {
-        if (token == address(0)) revert ZeroAddress();
-        uint256 bal = amount == 0
-            ? IERC20(token).balanceOf(address(this))
-            : amount;
+    /// @notice Kontrattaki tüm token bakiyesini sahibine çek
+    function withdrawToken(address token) external {
+        if (msg.sender != owner) revert Unauthorized();
+        uint256 bal = IERC20(token).balanceOf(address(this));
+        if (bal == 0) revert ZeroAmount();
         _safeTransfer(token, owner, bal);
         emit EmergencyTokenWithdraw(token, bal, owner);
     }
 
-    /// @notice Rescue stuck ETH
-    function emergencyWithdrawEth() external onlyOwner {
+    /// @notice Kontrattaki tüm ETH bakiyesini sahibine çek
+    function withdrawETH() external {
+        if (msg.sender != owner) revert Unauthorized();
         uint256 bal = address(this).balance;
         if (bal == 0) revert ZeroAmount();
         (bool ok, ) = owner.call{value: bal}("");
@@ -421,29 +415,34 @@ contract ArbitrajBotu {
         emit EmergencyETHWithdraw(bal, owner);
     }
 
-    // ══════════════════════════════════════════════
-    //                VIEW HELPERS
-    // ══════════════════════════════════════════════
+    // ═════════════════════════════════════════════════════════════════════════
+    //  VIEW — Bakiye Sorgulama
+    // ═════════════════════════════════════════════════════════════════════════
 
-    /// @notice Check token balance held by the contract
+    /// @notice Kontrat'ın belirli bir token bakiyesini döndür
     function getBalance(address token) external view returns (uint256) {
         return IERC20(token).balanceOf(address(this));
     }
 
-    // ══════════════════════════════════════════════
-    //              INTERNAL HELPERS
-    // ══════════════════════════════════════════════
+    // ═════════════════════════════════════════════════════════════════════════
+    //  INTERNAL — Güvenli ERC20 Transfer (Non-Standard Token Desteği)
+    // ═════════════════════════════════════════════════════════════════════════
 
-    /// @dev Transfer with explicit success check
+    /// @dev Low-level call ile ERC20 transfer. USDT gibi bool dönmeyen
+    ///      token'ları da destekler. Başarısız olursa revert.
     function _safeTransfer(address token, address to, uint256 amt) internal {
-        bool ok = IERC20(token).transfer(to, amt);
-        if (!ok) revert TransferFailed();
+        (bool ok, bytes memory ret) = token.call(
+            abi.encodeWithSelector(IERC20.transfer.selector, to, amt)
+        );
+        // Başarı koşulu: call başarılı VE (veri yok VEYA true döndü)
+        if (!ok || (ret.length > 0 && !abi.decode(ret, (bool)))) {
+            revert TransferFailed();
+        }
     }
 
-    // ══════════════════════════════════════════════
-    //                   RECEIVE
-    // ══════════════════════════════════════════════
+    // ═════════════════════════════════════════════════════════════════════════
+    //  RECEIVE — ETH kabul (WETH unwrap iadesi vb.)
+    // ═════════════════════════════════════════════════════════════════════════
 
-    /// @notice Accept ETH (e.g. WETH unwrap refund)
     receive() external payable {}
 }

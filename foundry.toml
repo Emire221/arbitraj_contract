@@ -4,8 +4,12 @@ out = "out"
 libs = ["lib"]
 
 # Solidity compiler
-solc_version = "0.8.20"
-evm_version = "paris"
+solc_version = "0.8.27"
+evm_version = "cancun"
+
+# Warning 2394 = EIP-1153 transient storage composability uyarısı.
+# Kontrat tüm tstore slot'larını çağrı sonunda temizliyor (composability-safe).
+ignored_error_codes = [2394]
 
 # Optimizer — production-ready settings
 optimizer = true
