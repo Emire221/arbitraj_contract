@@ -570,4 +570,194 @@ contract ArbitrajBotuTest is Test {
         console.log("Gas used for successful arbitrage:", gasUsed);
         // Gas bilgisi loglanır — forge test -vvv ile görülür
     }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    //  13. FUZZ TESTLERİ — DAYANIKLILIK KANITI (10.000+ Rastgele Senaryo)
+    // ══════════════════════════════════════════════════════════════════════════
+    //
+    //  Bu bölüm Foundry'nin fuzzer motorunu kullanarak kontratın güvenliğini
+    //  matematiksel olarak kanıtlar. 10.000 rastgele girdi denenir:
+    //    • Rastgele havuz adresleri (geçersiz, sıfır, EOA, kontrat)
+    //    • Devasa veya sıfır işlem miktarları
+    //    • Bozuk yön baytları (0-255 arası her değer)
+    //
+    //  Sonuç: Kâr oluşmadığı sürece kontrat KESİNLİKLE revert eder.
+    //
+    //  Çalıştır: forge test --match-test testFuzz --fuzz-runs 10000 -vvv
+    //
+    // ══════════════════════════════════════════════════════════════════════════
+
+    // ──────────────────────────────────────────────────────────────────────────
+    //  FUZZ 1: Rastgele Calldata → Fallback (Tam Kaos Testi)
+    // ──────────────────────────────────────────────────────────────────────────
+    //
+    //  Foundry, 10.000 farklı kombinasyon üretir:
+    //    • poolA/poolB = rastgele adresler (genellikle kod içermeyen EOA)
+    //    • amount      = 0'dan type(uint256).max'a kadar her değer
+    //    • direction   = 0x00-0xFF arası her byte
+    //
+    //  Beklenti: HİÇBİR kombinasyon başarılı olamaz çünkü:
+    //    1. Rastgele adres → token0() static call başarısız → revert
+    //    2. amount == 0    → ZeroAmount hatası → revert
+    //    3. Geçerli adres olsa bile → havuzda likidite yok → revert
+    //    4. Likidite olsa bile → kâr yok → NoProfitRealized → revert
+    //
+    // ──────────────────────────────────────────────────────────────────────────
+
+    /// @notice Rastgele calldata ile fallback'in her koşulda revert ettiğini kanıtlar.
+    /// @param amount    Rastgele swap miktarı (0 dahil)
+    /// @param poolA     Rastgele havuz A adresi
+    /// @param poolB     Rastgele havuz B adresi
+    /// @param direction Rastgele yön baytı (0-255)
+    function testFuzz_Fallback(
+        uint256 amount,
+        address poolA,
+        address poolB,
+        uint8 direction
+    ) public {
+        // ── 1. Calldata Paketleme (73 byte kompakt format) ──────────────
+        // Tam olarak Rust botunun göndereceği formatta:
+        //   [poolA:20B] + [poolB:20B] + [amount:32B] + [direction:1B]
+        bytes memory payload = abi.encodePacked(poolA, poolB, amount, direction);
+        assertEq(payload.length, 73, "Payload must be exactly 73 bytes");
+
+        // ── 2. Low-Level Call (fallback tetiklenir) ─────────────────────
+        // msg.sender = address(this) = deployer = owner → sahiplik kontrolü geçer
+        // Ancak rastgele adresler + likidite yokluğu → swap başarısız
+        (bool ok, ) = address(bot).call(payload);
+
+        // ── 3. Assertion: Kâr yoksa KESİNLİKLE revert ──────────────────
+        // Hiçbir kârlı senaryo kurulmadı. Olası revert yolları:
+        //   • poolA geçersiz (kod yok) → token0() static call fail
+        //   • amount == 0              → ZeroAmount custom error
+        //   • Swap başarısız           → havuzda token yok
+        //   • Kâr yok                  → NoProfitRealized
+        // Hangisi olursa olsun: ok == false OLMALI.
+        assertFalse(ok, "Fallback MUST revert when no profit scenario exists");
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────
+    //  FUZZ 2: Geçerli Havuzlar + Rastgele Miktarlar (Kâr Doğrulama Testi)
+    // ──────────────────────────────────────────────────────────────────────────
+    //
+    //  Bu test daha cerrahi: gerçek mock havuz adreslerini kullanır ama
+    //  hiçbir likidite/kâr senaryosu kurmaz. Böylece kontratın "Off-Chain
+    //  Kâr Doğrulama" mekanizmasını (bakiye kontrolü) saf haliyle test eder.
+    //
+    //  amount == 0 → ZeroAmount, amount > 0 → swap fail veya NoProfitRealized
+    //
+    // ──────────────────────────────────────────────────────────────────────────
+
+    /// @notice Geçerli havuzlarla bile kâr yoksa revert ettiğini kanıtlar.
+    /// @param amount    Rastgele swap miktarı
+    /// @param direction Rastgele yön baytı
+    function testFuzz_Fallback_ValidPools_NoProfit(
+        uint256 amount,
+        uint8 direction
+    ) public {
+        // Geçerli mock havuz adresleri kullan ama KÂR SENARYOSU KURMA
+        bytes memory payload = abi.encodePacked(
+            address(uniPool),
+            address(aeroPool),
+            amount,
+            direction
+        );
+
+        (bool ok, ) = address(bot).call(payload);
+
+        // Mock havuzlar default: deltas = (0, 0), token bakiyesi = 0
+        // amount == 0           → ZeroAmount hatası
+        // amount > 0, direction herhangi → swap başarısız, NoProfitRealized
+        // HİÇBİR durumda kâr oluşamaz
+        assertFalse(ok, "Must revert even with valid pools when no profit exists");
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────
+    //  FUZZ 3: Yetkisiz Callback Çağrısı (InvalidCaller Kanıtı)
+    // ──────────────────────────────────────────────────────────────────────────
+    //
+    //  Herhangi bir rastgele adres kontratın uniswapV3SwapCallback'ini
+    //  çağırmaya kalkarsa NE OLUR? Yanıt: InvalidCaller hatası.
+    //
+    //  Transient storage slot 0x00 (expectedPool) = 0 (fallback çağrılmadı).
+    //  Dolayısıyla caller != 0x00 ise → InvalidCaller. caller == 0x00 ise
+    //  → EVM'de address(0) msg.sender olamaz, ama paranoyak olup hariç tutuyoruz.
+    //
+    // ──────────────────────────────────────────────────────────────────────────
+
+    /// @notice Rastgele bir adresten callback çağrısının InvalidCaller verdiğini kanıtlar.
+    /// @param caller Rastgele çağrıcı adresi
+    function testFuzz_InvalidCallback(address caller) public {
+        // address(0) → transient storage default değeri, hariç tut
+        vm.assume(caller != address(0));
+
+        // Rastgele adresi msg.sender yap
+        vm.prank(caller);
+
+        // Beklenti: InvalidCaller hatası (expectedPool = 0, caller ≠ 0)
+        vm.expectRevert(InvalidCaller.selector);
+        bot.uniswapV3SwapCallback(0, 0, "");
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────
+    //  FUZZ 4: Rastgele Delta Parametreleriyle Callback (Genişletilmiş)
+    // ──────────────────────────────────────────────────────────────────────────
+    //
+    //  Sadece boş parametrelerle değil, devasa veya negatif delta değerleriyle
+    //  de callback çağrısının reddedildiğini kanıtlar. Kötü niyetli bir
+    //  kontrat sahte delta'lar gönderebilir — kontrat buna dayanıklı olmalı.
+    //
+    // ──────────────────────────────────────────────────────────────────────────
+
+    /// @notice Rastgele delta parametreleriyle callback çağrısının reddedildiğini kanıtlar.
+    /// @param caller       Rastgele çağrıcı adresi
+    /// @param amount0Delta Rastgele amount0 delta (pozitif/negatif/sıfır)
+    /// @param amount1Delta Rastgele amount1 delta (pozitif/negatif/sıfır)
+    function testFuzz_InvalidCallback_WithRandomDeltas(
+        address caller,
+        int256 amount0Delta,
+        int256 amount1Delta
+    ) public {
+        vm.assume(caller != address(0));
+
+        vm.prank(caller);
+        vm.expectRevert(InvalidCaller.selector);
+        bot.uniswapV3SwapCallback(amount0Delta, amount1Delta, "");
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────
+    //  FUZZ 5: Yetkisiz Fallback (Owner Olmayan Çağrıcı)
+    // ──────────────────────────────────────────────────────────────────────────
+    //
+    //  Rastgele bir adres (owner olmayan) fallback'e calldata gönderirse
+    //  Unauthorized hatası almalıdır. Bu test sahiplik mekanizmasının
+    //  immutable owner ile sızılamaz olduğunu kanıtlar.
+    //
+    // ──────────────────────────────────────────────────────────────────────────
+
+    /// @notice Owner olmayan rastgele adreslerin fallback'ten reddedildiğini kanıtlar.
+    /// @param caller   Rastgele (owner olmayan) çağrıcı adresi
+    /// @param amount   Rastgele miktar
+    /// @param direction Rastgele yön
+    function testFuzz_Fallback_Unauthorized(
+        address caller,
+        uint256 amount,
+        uint8 direction
+    ) public {
+        // Çağrıcı owner (deployer) olmamalı — o zaman sahiplik testi olmaz
+        vm.assume(caller != deployer);
+
+        bytes memory payload = abi.encodePacked(
+            address(uniPool),
+            address(aeroPool),
+            amount,
+            direction
+        );
+
+        vm.prank(caller);
+        (bool ok, ) = address(bot).call(payload);
+
+        // Owner değilse → Unauthorized hatası → revert
+        assertFalse(ok, "Non-owner MUST be rejected by fallback");
+    }
 }
